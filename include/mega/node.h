@@ -475,7 +475,7 @@ struct MEGA_API Node : public NodeCore, FileFingerprint
         // i.e. the parent is a file not a folder
         FLAGS_IS_IN_RUBBISH = 1,     // This bit is active if node is in rubbish bin
         // i.e. the root ansestor is the rubbish bin
-        FLAGS_IS_MARKED_SENSTIVE = 2,// This bit is active if node is marked as sensitive
+        FLAGS_IS_MARKED_SENSITIVE = 2, // This bit is active if node is marked as sensitive
         // that is it and every descendent is to be considered
         // sensitive
         // i.e. the 'sen' attribute is set

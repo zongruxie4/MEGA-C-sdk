@@ -84,10 +84,14 @@ protected:
     std::string mLeafFileName;
     std::string mLeafFileFingerprint; // serialised FileFingerprint blob
     NodeHandle mLeafParentHandle; // direct parent (sub-folder)
+    m_off_t mLeafFileSize{};
+    m_time_t mLeafFileMtime{};
 
     // Representative video leaf file for mime-filter cursor tests (i=0, j=0, k=25)
     NodeHandle mVideoLeafHandle; // k=25 → k%10==5 → .mp4
     std::string mVideoLeafFileName;
+    m_off_t mVideoLeafSize{};
+    m_time_t mVideoLeafMtime{};
 
     void SetUp() override
     {
@@ -147,6 +151,14 @@ protected:
             node->isvalid = true;
             node->serializefingerprint(&node->attrs.map['c']);
             node->setfingerprint();
+
+            // sizeVirtual in the DB is derived from NodeCounter.storage.
+            // Without this, ORDER BY sizeVirtual returns 0 for all files and
+            // cursor-based pagination for SIZE sorts would not advance.
+            NodeCounter nc;
+            nc.files = 1;
+            nc.storage = node->size;
+            node->setCounter(nc);
         }
 
         if (fav)
@@ -176,7 +188,7 @@ protected:
         auto rootNode = addNode(ROOTNODE, nullptr, "ROOT");
         mRootHandle = rootNode->nodeHandle();
         addNode(VAULTNODE, nullptr, "VAULT");
-        addNode(RUBBISHNODE, nullptr, "RUBBISH");
+        auto rubbishNode = addNode(RUBBISHNODE, nullptr, "RUBBISH");
 
         bool leafCaptured = false;
 
@@ -219,6 +231,8 @@ protected:
                         mLeafFileHandle = file->nodeHandle();
                         mLeafFileName = fname;
                         mLeafParentHandle = subFolder->nodeHandle();
+                        mLeafFileSize = file->size;
+                        mLeafFileMtime = file->mtime;
 
                         // Persist the fingerprint blob for later use.
                         auto it = file->attrs.map.find('c');
@@ -233,9 +247,23 @@ protected:
                     {
                         mVideoLeafHandle = file->nodeHandle();
                         mVideoLeafFileName = fname;
+                        mVideoLeafSize = file->size;
+                        mVideoLeafMtime = file->mtime;
                     }
                 }
             }
+        }
+
+        // Additional files in rubbish — 1/10 of Cloud Drive file count. These
+        // match the same MIME distribution so they appear in the mimetypeVirtual
+        // index but MUST be excluded by the filesRoot filter. Exercises the
+        // "index match rate but filter rejects" path.
+        const int rubbishCount = NUM_TOP_FOLDERS * NUM_SUB_PER_TOP * NUM_FILES_PER_SUB / 10;
+        for (int k = 0; k < rubbishCount; ++k)
+        {
+            const char* ext = (k % 10 < 5) ? ".jpg" : (k % 10 == 5) ? ".mp4" : ".txt";
+            std::string fname = "rubbish_" + std::to_string(k) + ext;
+            addNode(FILENODE, rubbishNode, fname);
         }
     }
 
@@ -258,15 +286,11 @@ protected:
         {
             case OrderByClause::SIZE_ASC:
             case OrderByClause::SIZE_DESC:
-                // sizeVirtual == 0 for all perf-test nodes (NodeCounter is not
-                // pre-computed in populateDB). The name / handle tie-breaker
-                // exercises the same SQL branches as production data.
-                c.mLastSize = 0;
+                c.mLastSize = mLeafFileSize;
                 break;
             case OrderByClause::MTIME_ASC:
             case OrderByClause::MTIME_DESC:
-                // mtime is stored as a plain column and is always accurate.
-                c.mLastMtime = 1700000000LL + static_cast<int64_t>(mLeafFileHandle.as8byte());
+                c.mLastMtime = mLeafFileMtime;
                 break;
             case OrderByClause::LABEL_ASC:
             case OrderByClause::LABEL_DESC:
@@ -293,11 +317,11 @@ protected:
         {
             case OrderByClause::SIZE_ASC:
             case OrderByClause::SIZE_DESC:
-                c.mLastSize = 0;
+                c.mLastSize = mVideoLeafSize;
                 break;
             case OrderByClause::MTIME_ASC:
             case OrderByClause::MTIME_DESC:
-                c.mLastMtime = 1700000000LL + static_cast<int64_t>(mVideoLeafHandle.as8byte());
+                c.mLastMtime = mVideoLeafMtime;
                 break;
             case OrderByClause::LABEL_ASC:
             case OrderByClause::LABEL_DESC:
@@ -1264,18 +1288,25 @@ TEST_P(SqliteNodesPerfListAllByPageTest, DISABLED_Perf)
         cursorOpt = (param.mimeType == MIME_TYPE_VIDEO) ? videoLeafCursor(param.order) :
                                                           leafCursor(param.order);
 
-    const long long us = measureUs(
-        COMPLEX_ITERS,
-        [&]
-        {
-            std::vector<std::pair<NodeHandle, NodeSerialized>> nodes;
-            CancelToken ct;
-            table->listAllNodesByPage(param.mimeType, param.order, nodes, ct, pageSize, cursorOpt);
-        });
+    ListAllNodesParams lparams;
+    lparams.mimeType = param.mimeType;
+    lparams.order = param.order;
+    lparams.maxElements = pageSize;
+    lparams.excludeSensitive = false;
+    lparams.cursor = cursorOpt;
+    const std::vector<NodeHandle> filesRoots{mRootHandle};
+
+    const long long us = measureUs(COMPLEX_ITERS,
+                                   [&]
+                                   {
+                                       std::vector<std::pair<NodeHandle, NodeSerialized>> nodes;
+                                       CancelToken ct;
+                                       table->listAllNodesByPage(lparams, filesRoots, nodes, ct);
+                                   });
 
     std::vector<std::pair<NodeHandle, NodeSerialized>> nodes;
     CancelToken ct;
-    table->listAllNodesByPage(param.mimeType, param.order, nodes, ct, pageSize, cursorOpt);
+    table->listAllNodesByPage(lparams, filesRoots, nodes, ct);
 
     if (param.firstPage)
     {

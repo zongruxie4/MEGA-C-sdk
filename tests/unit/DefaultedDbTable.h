@@ -110,12 +110,10 @@ public:
         //throw NotImplemented(__func__);
     }
 
-    bool listAllNodesByPage(mega::MimeType_t,
-                            int,
+    bool listAllNodesByPage(const mega::ListAllNodesParams&,
+                            const std::vector<mega::NodeHandle>&,
                             std::vector<std::pair<mega::NodeHandle, mega::NodeSerialized>>&,
-                            mega::CancelToken,
-                            size_t,
-                            const std::optional<mega::NodeSearchCursorOffset>&) override
+                            mega::CancelToken) override
     {
         return false;
     }

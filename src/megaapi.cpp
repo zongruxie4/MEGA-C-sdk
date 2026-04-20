@@ -4614,7 +4614,23 @@ MegaNodeList* MegaApi::listAllNodesByPage(int mimeType,
                                           size_t maxElements,
                                           const MegaSearchCursorOffset* cursor)
 {
-    return pImpl->listAllNodesByPage(mimeType,
+    // Legacy 5-arg overload. Preserves a filter-free public entry point; forwards
+    // to the MegaListAllNodesFilter overload with the default (rootnode = Cloud +
+    // Vault) scope and no sensitivity filter — matches MegaApi::search's
+    // SEARCH_TARGET_ROOTNODE semantics and widens the previous Cloud-only scope.
+    // See Doxygen in megaapi.h.
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(mimeType);
+    return listAllNodesByPage(filter.get(), order, cancelToken, maxElements, cursor);
+}
+
+MegaNodeList* MegaApi::listAllNodesByPage(const MegaListAllNodesFilter* filter,
+                                          int order,
+                                          MegaCancelToken* cancelToken,
+                                          size_t maxElements,
+                                          const MegaSearchCursorOffset* cursor)
+{
+    return pImpl->listAllNodesByPage(filter,
                                      order,
                                      convertToCancelToken(cancelToken),
                                      maxElements,
@@ -7497,6 +7513,55 @@ const char* MegaSearchFilter::byTag() const
 bool MegaSearchFilter::useAndForTextQuery() const
 {
     return false;
+}
+
+MegaListAllNodesFilter::MegaListAllNodesFilter() {}
+
+MegaListAllNodesFilter* MegaListAllNodesFilter::createInstance()
+{
+    return new MegaListAllNodesFilterPrivate();
+}
+
+MegaListAllNodesFilter* MegaListAllNodesFilter::copy() const
+{
+    return nullptr;
+}
+
+MegaListAllNodesFilter::~MegaListAllNodesFilter() {}
+
+void MegaListAllNodesFilter::byCategory(int /*mimeType*/) {}
+
+int MegaListAllNodesFilter::byCategory() const
+{
+    return MegaApi::FILE_TYPE_DEFAULT;
+}
+
+void MegaListAllNodesFilter::byLocationHandles(const MegaHandleList* /*ancestorHandles*/) {}
+
+MegaHandleList* MegaListAllNodesFilter::byLocationHandles() const
+{
+    return nullptr;
+}
+
+void MegaListAllNodesFilter::byExcludeLocationHandles(const MegaHandleList* /*excludeHandles*/) {}
+
+MegaHandleList* MegaListAllNodesFilter::byExcludeLocationHandles() const
+{
+    return nullptr;
+}
+
+void MegaListAllNodesFilter::byLocation(int /*scope*/) {}
+
+int MegaListAllNodesFilter::byLocation() const
+{
+    return MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT;
+}
+
+void MegaListAllNodesFilter::bySensitivity(int /*filterOption*/) {}
+
+int MegaListAllNodesFilter::bySensitivity() const
+{
+    return MegaListAllNodesFilter::SENSITIVITY_SHOW_ALL;
 }
 
 MegaSearchPage::MegaSearchPage()

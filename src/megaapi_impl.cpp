@@ -6927,6 +6927,74 @@ int MegaSearchFilterPrivate::validateBoolFilterOption(const int value)
     }
 }
 
+void MegaListAllNodesFilterPrivate::byCategory(int mimeType)
+{
+    if (mimeType <= MegaApi::FILE_TYPE_DEFAULT || MegaApi::FILE_TYPE_LAST < mimeType)
+    {
+        LOG_warn << "Invalid mimeType for MegaListAllNodesFilter: " << mimeType << ". Ignored.";
+        return;
+    }
+    mCategory = mimeType;
+}
+
+void MegaListAllNodesFilterPrivate::copyMegaHandleListInto(const MegaHandleList* src,
+                                                           std::vector<MegaHandle>& dst)
+{
+    dst.clear();
+    if (!src)
+        return;
+    const unsigned size = src->size();
+    dst.reserve(size);
+    for (unsigned i = 0; i < size; ++i)
+        dst.push_back(src->get(i));
+}
+
+void MegaListAllNodesFilterPrivate::byLocationHandles(const MegaHandleList* ancestorHandles)
+{
+    copyMegaHandleListInto(ancestorHandles, mLocationHandles);
+}
+
+void MegaListAllNodesFilterPrivate::byExcludeLocationHandles(const MegaHandleList* excludeHandles)
+{
+    copyMegaHandleListInto(excludeHandles, mExcludeLocationHandles);
+}
+
+void MegaListAllNodesFilterPrivate::byLocation(int scope)
+{
+    mLocation = scope;
+}
+
+MegaHandleList* MegaListAllNodesFilterPrivate::byLocationHandles() const
+{
+    auto* list = MegaHandleList::createInstance();
+    for (const MegaHandle h: mLocationHandles)
+        list->addMegaHandle(h);
+    return list;
+}
+
+MegaHandleList* MegaListAllNodesFilterPrivate::byExcludeLocationHandles() const
+{
+    auto* list = MegaHandleList::createInstance();
+    for (const MegaHandle h: mExcludeLocationHandles)
+        list->addMegaHandle(h);
+    return list;
+}
+
+void MegaListAllNodesFilterPrivate::bySensitivity(int filterOption)
+{
+    switch (filterOption)
+    {
+        case MegaListAllNodesFilter::SENSITIVITY_SHOW_ALL:
+        case MegaListAllNodesFilter::SENSITIVITY_HIDE_SENSITIVE:
+            mSensitivity = filterOption;
+            return;
+        default:
+            LOG_warn << "Invalid value for MegaListAllNodesFilter::bySensitivity: " << filterOption
+                     << ". Ignored.";
+            return;
+    }
+}
+
 std::unique_ptr<MegaGfxProviderPrivate>
     MegaGfxProviderPrivate::createIsolatedInstance([[maybe_unused]] const char* endpointName,
                                                    [[maybe_unused]] const char* executable,
@@ -13330,18 +13398,100 @@ sharedNode_vector MegaApiImpl::searchInNodeManager(const MegaSearchFilter* filte
     return results;
 }
 
-MegaNodeList* MegaApiImpl::listAllNodesByPage(int mimeType,
-                                              int order,
-                                              CancelToken cancelToken,
-                                              size_t maxElements,
-                                              const MegaSearchCursorOffset* megaCursor)
+// nodemanager.h cannot include megaapi.h (layering), so the default scope and
+// the location-handles cap are duplicated as kDefaultListAllLocationScope and
+// kListAllMaxLocationHandles. This translation unit sees both the duplicated
+// constants and the public-API constants, and is the natural place to enforce
+// that they stay in sync.
+static_assert(kDefaultListAllLocationScope ==
+                  MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT,
+              "kDefaultListAllLocationScope must mirror "
+              "MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT");
+static_assert(kListAllMaxLocationHandles == MegaListAllNodesFilter::MAX_LOCATION_HANDLES,
+              "kListAllMaxLocationHandles must mirror "
+              "MegaListAllNodesFilter::MAX_LOCATION_HANDLES");
+
+namespace
 {
-    if (mimeType <= MegaApi::FILE_TYPE_DEFAULT || mimeType > MegaApi::FILE_TYPE_LAST)
+// Validates a MegaHandleList (size cap + INVALID_HANDLE rejection) and converts
+// it to NodeHandle, appending to `out`. Null list is treated as empty.
+bool extractListAllHandles(const MegaHandleList* listOwner,
+                           const char* fieldName,
+                           std::vector<NodeHandle>& out)
+{
+    if (!listOwner)
+        return true;
+    const unsigned n = listOwner->size();
+    if (n > MegaListAllNodesFilter::MAX_LOCATION_HANDLES)
     {
-        LOG_warn << "listAllNodesByPage: invalid mimeType value " << mimeType;
-        return new MegaNodeListPrivate();
+        LOG_warn << "listAllNodesByPage: " << fieldName << " size " << n
+                 << " exceeds MAX_LOCATION_HANDLES="
+                 << MegaListAllNodesFilter::MAX_LOCATION_HANDLES;
+        return false;
+    }
+    out.reserve(out.size() + n);
+    for (unsigned i = 0; i < n; ++i)
+    {
+        const MegaHandle h = listOwner->get(i);
+        if (h == INVALID_HANDLE)
+        {
+            LOG_warn << "listAllNodesByPage: " << fieldName
+                     << " contains INVALID_HANDLE entry at position " << i;
+            return false;
+        }
+        NodeHandle nh;
+        nh.set6byte(h);
+        out.push_back(nh);
+    }
+    return true;
+}
+} // anonymous namespace
+
+std::optional<ListAllNodesParams>
+    MegaApiImpl::buildListAllParams(const MegaListAllNodesFilter* filter,
+                                    int order,
+                                    size_t maxElements,
+                                    const MegaSearchCursorOffset* megaCursor) const
+{
+    if (!filter)
+    {
+        LOG_warn << "listAllNodesByPage: filter is nullptr";
+        return std::nullopt;
     }
 
+    const int mimeType = filter->byCategory();
+    if (mimeType <= MegaApi::FILE_TYPE_DEFAULT || mimeType > MegaApi::FILE_TYPE_LAST)
+    {
+        LOG_warn << "listAllNodesByPage: invalid byCategory value " << mimeType;
+        return std::nullopt;
+    }
+
+    const bool excludeSensitive =
+        (filter->bySensitivity() == MegaListAllNodesFilter::SENSITIVITY_HIDE_SENSITIVE);
+
+    // Validate byLocation scope range early.
+    const int locationScope = filter->byLocation();
+    switch (locationScope)
+    {
+        case MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE:
+        case MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT:
+        case MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH:
+            break;
+        default:
+            LOG_warn << "listAllNodesByPage: invalid byLocation value " << locationScope;
+            return std::nullopt;
+    }
+
+    std::vector<NodeHandle> explicitAncestors;
+    std::vector<NodeHandle> excludeHandles;
+    std::unique_ptr<MegaHandleList> includeList(filter->byLocationHandles());
+    if (!extractListAllHandles(includeList.get(), "byLocationHandles", explicitAncestors))
+        return std::nullopt;
+    std::unique_ptr<MegaHandleList> excludeList(filter->byExcludeLocationHandles());
+    if (!extractListAllHandles(excludeList.get(), "byExcludeLocationHandles", excludeHandles))
+        return std::nullopt;
+
+    // ── Cursor validation (preserved from legacy impl) ──────────────────────
     NodeSearchCursorOffset c;
     if (megaCursor)
     {
@@ -13349,13 +13499,13 @@ MegaNodeList* MegaApiImpl::listAllNodesByPage(int mimeType,
         if (!lastName || !*lastName)
         {
             LOG_warn << "listAllNodesByPage: cursor has missing or empty last name.";
-            return new MegaNodeListPrivate();
+            return std::nullopt;
         }
         const MegaHandle lastHandle = megaCursor->getLastHandle();
         if (lastHandle == INVALID_HANDLE)
         {
             LOG_warn << "listAllNodesByPage: cursor has invalid last handle.";
-            return new MegaNodeListPrivate();
+            return std::nullopt;
         }
         c.mLastName = lastName;
         c.mLastHandle = static_cast<handle>(lastHandle);
@@ -13374,7 +13524,7 @@ MegaNodeList* MegaApiImpl::listAllNodesByPage(int mimeType,
                 {
                     LOG_warn << "listAllNodesByPage: cursor has missing or negative last size: "
                              << lastSize;
-                    return new MegaNodeListPrivate();
+                    return std::nullopt;
                 }
                 c.mLastSize = lastSize;
             }
@@ -13388,7 +13538,7 @@ MegaNodeList* MegaApiImpl::listAllNodesByPage(int mimeType,
                 {
                     LOG_warn << "listAllNodesByPage: cursor has missing or invalid last mtime: "
                              << lastMtime;
-                    return new MegaNodeListPrivate();
+                    return std::nullopt;
                 }
                 c.mLastMtime = lastMtime;
             }
@@ -13403,7 +13553,7 @@ MegaNodeList* MegaApiImpl::listAllNodesByPage(int mimeType,
                     LOG_warn
                         << "listAllNodesByPage: cursor has missing or out-of-range last label: "
                         << lastLabel;
-                    return new MegaNodeListPrivate();
+                    return std::nullopt;
                 }
                 c.mLastLabel = lastLabel;
             }
@@ -13417,30 +13567,41 @@ MegaNodeList* MegaApiImpl::listAllNodesByPage(int mimeType,
                 {
                     LOG_warn << "listAllNodesByPage: cursor has missing or invalid last fav value: "
                              << lastFav;
-                    return new MegaNodeListPrivate();
+                    return std::nullopt;
                 }
                 c.mLastFav = lastFav;
             }
             break;
         default:
             LOG_warn << "listAllNodesByPage: unsupported order value: " << order;
-            return new MegaNodeListPrivate();
+            return std::nullopt;
     }
 
-    std::optional<NodeSearchCursorOffset> cursor;
+    ListAllNodesParams params;
+    params.mimeType = static_cast<MimeType_t>(mimeType);
+    params.order = order;
+    params.maxElements = maxElements;
+    params.excludeSensitive = excludeSensitive;
     if (megaCursor)
-    {
-        cursor = std::move(c);
-    }
+        params.cursor = std::move(c);
+    params.explicitAncestors = std::move(explicitAncestors);
+    params.excludeHandles = std::move(excludeHandles);
+    params.locationScope = locationScope;
+    return params;
+}
 
-    const auto internalMimeType = static_cast<MimeType_t>(mimeType);
+MegaNodeList* MegaApiImpl::listAllNodesByPage(const MegaListAllNodesFilter* filter,
+                                              int order,
+                                              CancelToken cancelToken,
+                                              size_t maxElements,
+                                              const MegaSearchCursorOffset* megaCursor)
+{
+    auto params = buildListAllParams(filter, order, maxElements, megaCursor);
+    if (!params)
+        return new MegaNodeListPrivate();
 
     SdkMutexGuard g(sdkMutex);
-    sharedNode_vector results = client->mNodeManager.listAllNodesByPage(internalMimeType,
-                                                                        order,
-                                                                        cancelToken,
-                                                                        maxElements,
-                                                                        cursor);
+    sharedNode_vector results = client->mNodeManager.listAllNodesByPage(*params, cancelToken);
     return new MegaNodeListPrivate(results);
 }
 
