@@ -143,9 +143,16 @@ TEST(Sqlite, MigratesOldNodesSchema)
     LocalPath dbLocalPath = dbAccess.databasePath(*fsaccess, dbName, DbAccess::DB_VERSION);
     const std::string dbPathStr = dbLocalPath.toPath(false);
 
+    // sqlite3_open may allocate the handle even on error, and the handle
+    // must be released via sqlite3_close regardless. Wrap in unique_ptr so
+    // close runs on every exit path (including ASSERT_* aborts).
+    using SqliteHandle = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
+
     {
         sqlite3* raw = nullptr;
-        ASSERT_EQ(SQLITE_OK, sqlite3_open(dbPathStr.c_str(), &raw));
+        const int openRc = sqlite3_open(dbPathStr.c_str(), &raw);
+        SqliteHandle dbGuard{raw, &sqlite3_close};
+        ASSERT_EQ(SQLITE_OK, openRc);
 
         // NOTE: Keep this schema frozen — do not add or remove columns here.
         // It represents a pre-migration `nodes` table on disk, so the whole
@@ -172,7 +179,6 @@ TEST(Sqlite, MigratesOldNodesSchema)
         const int rc = sqlite3_exec(raw, oldSchema, nullptr, nullptr, &err);
         const std::string errStr = err ? err : "";
         sqlite3_free(err);
-        sqlite3_close(raw);
         ASSERT_EQ(SQLITE_OK, rc) << "Failed to seed old schema: " << errStr;
     }
 
@@ -214,7 +220,9 @@ TEST(Sqlite, MigratesOldNodesSchema)
     {
         std::set<std::string> cols;
         sqlite3* raw = nullptr;
-        if (sqlite3_open(path.c_str(), &raw) != SQLITE_OK)
+        const int openRc = sqlite3_open(path.c_str(), &raw);
+        SqliteHandle dbGuard{raw, &sqlite3_close};
+        if (openRc != SQLITE_OK)
             return cols;
         sqlite3_stmt* stmt = nullptr;
         const char* q = "SELECT name FROM pragma_table_xinfo('nodes')";
@@ -226,7 +234,6 @@ TEST(Sqlite, MigratesOldNodesSchema)
             }
         }
         sqlite3_finalize(stmt);
-        sqlite3_close(raw);
         return cols;
     };
 
