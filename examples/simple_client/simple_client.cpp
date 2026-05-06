@@ -41,6 +41,13 @@ using namespace mega;
 namespace
 {
 
+bool readYes()
+{
+    char c;
+    std::cin >> c; // skips whitespace, waits for Enter
+    return (c == 'y' || c == 'Y');
+}
+
 class SimpleClientLogger: public MegaLogger
 {
 public:
@@ -318,9 +325,8 @@ int main()
     // Add code here to exercise MegaApi
 
 #ifdef HAVE_LIBUV
-    std::cout << "Do you want to enable the local HTTP server (y/n)?" << std::endl;
-    int c = getchar();
-    if (c == 'y' || c == 'Y')
+    std::cout << "Do you want to enable the local HTTP server (y/n enter)?" << std::endl;
+    if (readYes())
     {
         megaApi->httpServerStart();
         megaApi->httpServerSetRestrictedMode(MegaApi::HTTP_SERVER_ALLOW_ALL);
@@ -330,8 +336,9 @@ int main()
     }
 #endif
 
-    std::cout << "Press Enter to exit the app..." << std::endl;
-    getchar();
+    std::cout << "Press y enter to exit the app..." << std::endl;
+    while (!readYes())
+    {}
 
 #ifdef HAVE_LIBUV
     megaApi->httpServerStop();
