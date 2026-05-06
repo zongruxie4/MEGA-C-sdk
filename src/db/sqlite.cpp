@@ -2532,13 +2532,25 @@ static const QueryTagId kLaIdPageSize{1};
 constexpr size_t kListAllMaxRoots = kListAllMaxLocationHandles;
 constexpr size_t kListAllMaxExcludes = kListAllMaxLocationHandles;
 
-// Cache key for mStmtListAllNodesByPage. Every dimension that varies the SQL text
-// must participate, or distinct shapes would collide on one prepared statement:
-// excludeSensitive is in the WHERE clause; numRoots and numExcludes set IN-list
-// arity. numExcludes = 0 is valid (emits the no-exclude branch).
+// Cache key for mStmtListAllNodesByPage. Each input is one
+// "digit" in a positional number, with a different base per
+// digit (its declared range). Every valid combination maps
+// to a unique key — distinct SQL shapes never collide on one
+// prepared statement (numRoots / numExcludes set IN-list
+// arity; excludeSensitive gates a WHERE clause).
 //
-// locationScope is intentionally NOT in the key — it only changes which rootnodes
-// are bound into filesRoots; the SQL depends only on numRoots.
+// locationScope is omitted: it only picks rootnodes; SQL
+// depends only on numRoots.
+//
+// Example — first page of photos (mimeType=1, order=1,
+// hasCursor=0, sens=0, numRoots=1, numExcludes=0):
+//   key = 1
+//   key = key * 21 + 1 = 22     // order, base 21
+//   key = key * 2  + 0 = 44     // hasCursor, base 2
+//   key = key * 2  + 0 = 88     // excludeSensitive, base 2
+//   key = key * 3  + 0 = 264    // numRoots-1, base 3
+//   key = key * 4  + 0 = 1056   // numExcludes, base 4
+// → 1056
 inline size_t computeListAllCacheId(MimeType_t mimeType,
                                     int order,
                                     bool hasCursor,
@@ -3005,6 +3017,64 @@ std::string buildUpWalkExists(int filesRootParam,
 //   3. [cursor] / [bounding]            — keyset pagination, optional
 // When excludeSensitive is true, filter 2 also requires every walked ancestor (n inclusive,
 // matched root exclusive) to have FLAGS_IS_MARKED_SENSITIVE clear.
+//
+// Rendered SQL examples (regenerate from this builder + buildUpWalkExists if either changes):
+//
+// Example 1 — ORDER_DEFAULT_ASC, 1 root, no cursor, no excludes, excludeSensitive=false.
+// Slot layout: ?1=LIMIT, ?2=mimeFilter, ?3=filesRoots[0].
+//
+//   SELECT nodehandle, counter, node, type, sizeVirtual, mtime, name, label, fav
+//   FROM nodes AS n
+//   WHERE mimetypeVirtual = ?2
+//     AND (n.flags & 1) = 0
+//     AND EXISTS (
+//       WITH RECURSIVE up(h, sensSeen) AS (
+//         SELECT n.parenthandle, 0
+//         UNION ALL
+//         SELECT p.parenthandle, 0
+//         FROM nodes AS p JOIN up ON p.nodehandle = up.h
+//         WHERE up.h IS NOT NULL AND up.h != -1   -- UNDEF
+//       )
+//       SELECT 1 FROM up WHERE up.h IN (?3) LIMIT 1
+//     )
+//   ORDER BY name COLLATE NATURALNOCASE ASC, nodehandle ASC
+//   LIMIT ?1
+//
+// Example 2 — ORDER_SIZE_DESC, 2 roots, hasCursor=true, 1 exclude, excludeSensitive=true.
+// Slot layout: ?1=LIMIT, ?2=mimeFilter, ?3..?4=filesRoots, ?5=excludeHandles[0],
+// ?6=cursor.lastSize, ?7=cursor.lastName, ?8=cursor.lastHandle.
+//
+//   SELECT nodehandle, counter, node, type, sizeVirtual, mtime, name, label, fav
+//   FROM nodes AS n
+//   WHERE mimetypeVirtual = ?2
+//     AND (n.flags & 1) = 0
+//     AND EXISTS (
+//       WITH RECURSIVE up(h, sensSeen, excSeen) AS (
+//         SELECT n.parenthandle,
+//                ((n.flags & 4) != 0),
+//                (n.nodehandle IN (?5))
+//         UNION ALL
+//         SELECT p.parenthandle,
+//                up.sensSeen OR ((p.flags & 4) != 0),
+//                up.excSeen OR (p.nodehandle IN (?5))
+//         FROM nodes AS p JOIN up ON p.nodehandle = up.h
+//         WHERE up.h IS NOT NULL AND up.h != -1   -- UNDEF
+//           AND up.sensSeen = 0
+//           AND up.excSeen = 0
+//       )
+//       SELECT 1 FROM up
+//       WHERE up.h IN (?3, ?4)
+//         AND up.sensSeen = 0
+//         AND up.excSeen = 0
+//         AND up.h NOT IN (?5)
+//       LIMIT 1
+//     )
+//     AND (sizeVirtual < ?6 OR (sizeVirtual = ?6 AND name <= ?7 COLLATE NATURALNOCASE))
+//     AND (sizeVirtual < ?6
+//          OR (sizeVirtual = ?6 AND name < ?7 COLLATE NATURALNOCASE)
+//          OR (sizeVirtual = ?6 AND name = ?7 COLLATE NATURALNOCASE AND nodehandle < ?8))
+//   ORDER BY sizeVirtual DESC, name COLLATE NATURALNOCASE DESC, nodehandle DESC
+//   LIMIT ?1
 std::string buildListAllRouteSelect(const std::string& mimeFilterClause,
                                     int order,
                                     bool hasCursor,
@@ -3258,7 +3328,6 @@ bool SqliteAccountState::listAllNodesByPage(
         LOG_warn << "listAllNodesByPage: cursor is missing the required field for order "
                  << params.order << "; cursor was likely built for a different sort order";
         sqlite3_progress_handler(db, -1, nullptr, nullptr);
-        errorHandler(sqlResult, "List all nodes by page (cursor-based)", true);
         sqlite3_reset(stmt);
         return false;
     }

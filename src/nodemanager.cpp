@@ -893,7 +893,6 @@ std::vector<NodeHandle> NodeManager::resolveListAllRoots(const ListAllNodesParam
         return {};
     }
     std::vector<NodeHandle> roots;
-    roots.reserve(3);
     if (!rootnodes.files.isUndef())
         roots.push_back(rootnodes.files);
     if (params.locationScope >= 1 /* LOCATION_CLOUD_DRIVE_AND_VAULT */

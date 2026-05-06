@@ -6944,7 +6944,6 @@ void MegaListAllNodesFilterPrivate::copyMegaHandleListInto(const MegaHandleList*
     if (!src)
         return;
     const unsigned size = src->size();
-    dst.reserve(size);
     for (unsigned i = 0; i < size; ++i)
         dst.push_back(src->get(i));
 }
@@ -13429,7 +13428,6 @@ bool extractListAllHandles(const MegaHandleList* listOwner,
                  << MegaListAllNodesFilter::MAX_LOCATION_HANDLES;
         return false;
     }
-    out.reserve(out.size() + n);
     for (unsigned i = 0; i < n; ++i)
     {
         const MegaHandle h = listOwner->get(i);
@@ -13444,6 +13442,96 @@ bool extractListAllHandles(const MegaHandleList* listOwner,
         out.push_back(nh);
     }
     return true;
+}
+
+// Builds a NodeSearchCursorOffset from megaCursor, validating the fields the
+// chosen sort order requires. Returns std::nullopt on validation failure.
+// The caller must have already accepted `order` as a supported value.
+std::optional<NodeSearchCursorOffset>
+    buildNodeSearchCursorOffset(const MegaSearchCursorOffset& megaCursor, int order)
+{
+    NodeSearchCursorOffset c;
+
+    const char* lastName = megaCursor.getLastName();
+    if (!lastName || !*lastName)
+    {
+        LOG_warn << "listAllNodesByPage: cursor has missing or empty last name.";
+        return std::nullopt;
+    }
+    const MegaHandle lastHandle = megaCursor.getLastHandle();
+    if (lastHandle == INVALID_HANDLE)
+    {
+        LOG_warn << "listAllNodesByPage: cursor has invalid last handle.";
+        return std::nullopt;
+    }
+    c.mLastName = lastName;
+    c.mLastHandle = static_cast<handle>(lastHandle);
+
+    switch (order)
+    {
+        case MegaApi::ORDER_DEFAULT_ASC:
+        case MegaApi::ORDER_DEFAULT_DESC:
+            break;
+        case MegaApi::ORDER_SIZE_ASC:
+        case MegaApi::ORDER_SIZE_DESC:
+        {
+            const int64_t lastSize = megaCursor.getLastSize();
+            if (lastSize < 0)
+            {
+                LOG_warn << "listAllNodesByPage: cursor has missing or negative last size: "
+                         << lastSize;
+                return std::nullopt;
+            }
+            c.mLastSize = lastSize;
+            break;
+        }
+        case MegaApi::ORDER_MODIFICATION_ASC:
+        case MegaApi::ORDER_MODIFICATION_DESC:
+        {
+            const int64_t lastMtime = megaCursor.getLastMtime();
+            if (lastMtime < 0)
+            {
+                LOG_warn << "listAllNodesByPage: cursor has missing or invalid last mtime: "
+                         << lastMtime;
+                return std::nullopt;
+            }
+            c.mLastMtime = lastMtime;
+            break;
+        }
+        case MegaApi::ORDER_LABEL_ASC:
+        case MegaApi::ORDER_LABEL_DESC:
+        {
+            const int lastLabel = megaCursor.getLastLabel();
+            if (lastLabel < MegaNode::NODE_LBL_UNKNOWN || lastLabel > MegaNode::NODE_LBL_GREY)
+            {
+                LOG_warn << "listAllNodesByPage: cursor has missing or out-of-range last label: "
+                         << lastLabel;
+                return std::nullopt;
+            }
+            c.mLastLabel = lastLabel;
+            break;
+        }
+        case MegaApi::ORDER_FAV_ASC:
+        case MegaApi::ORDER_FAV_DESC:
+        {
+            const int lastFav = megaCursor.getLastFav();
+            if (lastFav != 0 && lastFav != 1)
+            {
+                LOG_warn << "listAllNodesByPage: cursor has missing or invalid last fav value: "
+                         << lastFav;
+                return std::nullopt;
+            }
+            c.mLastFav = lastFav;
+            break;
+        }
+        default:
+            // Caller is responsible for filtering out unsupported orders.
+            assert(false && "buildNodeSearchCursorOffset: unsupported order leaked through");
+            LOG_warn << "listAllNodesByPage: unsupported order value: " << order;
+            return std::nullopt;
+    }
+
+    return c;
 }
 } // anonymous namespace
 
@@ -13491,89 +13579,31 @@ std::optional<ListAllNodesParams>
     if (!extractListAllHandles(excludeList.get(), "byExcludeLocationHandles", excludeHandles))
         return std::nullopt;
 
-    // ── Cursor validation (preserved from legacy impl) ──────────────────────
-    NodeSearchCursorOffset c;
-    if (megaCursor)
-    {
-        const char* lastName = megaCursor->getLastName();
-        if (!lastName || !*lastName)
-        {
-            LOG_warn << "listAllNodesByPage: cursor has missing or empty last name.";
-            return std::nullopt;
-        }
-        const MegaHandle lastHandle = megaCursor->getLastHandle();
-        if (lastHandle == INVALID_HANDLE)
-        {
-            LOG_warn << "listAllNodesByPage: cursor has invalid last handle.";
-            return std::nullopt;
-        }
-        c.mLastName = lastName;
-        c.mLastHandle = static_cast<handle>(lastHandle);
-    }
+    // ── Order validation (independent of cursor presence) ───────────────────
     switch (order)
     {
         case MegaApi::ORDER_DEFAULT_ASC:
         case MegaApi::ORDER_DEFAULT_DESC:
-            break;
         case MegaApi::ORDER_SIZE_ASC:
         case MegaApi::ORDER_SIZE_DESC:
-            if (megaCursor)
-            {
-                const int64_t lastSize = megaCursor->getLastSize();
-                if (lastSize < 0)
-                {
-                    LOG_warn << "listAllNodesByPage: cursor has missing or negative last size: "
-                             << lastSize;
-                    return std::nullopt;
-                }
-                c.mLastSize = lastSize;
-            }
-            break;
         case MegaApi::ORDER_MODIFICATION_ASC:
         case MegaApi::ORDER_MODIFICATION_DESC:
-            if (megaCursor)
-            {
-                const int64_t lastMtime = megaCursor->getLastMtime();
-                if (lastMtime < 0)
-                {
-                    LOG_warn << "listAllNodesByPage: cursor has missing or invalid last mtime: "
-                             << lastMtime;
-                    return std::nullopt;
-                }
-                c.mLastMtime = lastMtime;
-            }
-            break;
         case MegaApi::ORDER_LABEL_ASC:
         case MegaApi::ORDER_LABEL_DESC:
-            if (megaCursor)
-            {
-                const int lastLabel = megaCursor->getLastLabel();
-                if (lastLabel < MegaNode::NODE_LBL_UNKNOWN || lastLabel > MegaNode::NODE_LBL_GREY)
-                {
-                    LOG_warn
-                        << "listAllNodesByPage: cursor has missing or out-of-range last label: "
-                        << lastLabel;
-                    return std::nullopt;
-                }
-                c.mLastLabel = lastLabel;
-            }
-            break;
         case MegaApi::ORDER_FAV_ASC:
         case MegaApi::ORDER_FAV_DESC:
-            if (megaCursor)
-            {
-                const int lastFav = megaCursor->getLastFav();
-                if (lastFav != 0 && lastFav != 1)
-                {
-                    LOG_warn << "listAllNodesByPage: cursor has missing or invalid last fav value: "
-                             << lastFav;
-                    return std::nullopt;
-                }
-                c.mLastFav = lastFav;
-            }
             break;
         default:
             LOG_warn << "listAllNodesByPage: unsupported order value: " << order;
+            return std::nullopt;
+    }
+
+    // ── Cursor validation (only when supplied) ──────────────────────────────
+    std::optional<NodeSearchCursorOffset> cursor;
+    if (megaCursor)
+    {
+        cursor = buildNodeSearchCursorOffset(*megaCursor, order);
+        if (!cursor)
             return std::nullopt;
     }
 
@@ -13582,8 +13612,7 @@ std::optional<ListAllNodesParams>
     params.order = order;
     params.maxElements = maxElements;
     params.excludeSensitive = excludeSensitive;
-    if (megaCursor)
-        params.cursor = std::move(c);
+    params.cursor = std::move(cursor);
     params.explicitAncestors = std::move(explicitAncestors);
     params.excludeHandles = std::move(excludeHandles);
     params.locationScope = locationScope;
