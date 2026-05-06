@@ -503,34 +503,40 @@ sharedNode_list NodeManager::getChildren_internal(const Node* parent, CancelToke
             parent->mNodePosition->second.mChildren = std::make_unique<std::map<NodeHandle, NodeManagerNode*>>();
         }
 
-        for (const auto& nodeSerializedIt : nodesFromTable)
+        for (const auto& [childHandle, childSerialized]: nodesFromTable)
         {
             if (cancelToken.isCancelled())
             {
                 childrenList.clear();
-                return  childrenList;
+                return childrenList;
             }
 
-            auto childIt = parent->mNodePosition->second.mChildren->find(nodeSerializedIt.first);
-            if (childIt == parent->mNodePosition->second.mChildren->end() || !childIt->second) // handle or node not loaded
+            auto childIt = parent->mNodePosition->second.mChildren->find(childHandle);
+            const bool aliveUnderThisParent =
+                childIt != parent->mNodePosition->second.mChildren->end() && childIt->second &&
+                childIt->second->getNodeInRam(false) != nullptr;
+            if (aliveUnderThisParent)
             {
-                auto itNode = mNodes.find(nodeSerializedIt.first);
-                if ( itNode == mNodes.end() || !itNode->second.getNodeInRam())    // not loaded
-                {
-                    shared_ptr<Node> n(getNodeFromNodeSerialized(nodeSerializedIt.second));
-                    if (!n)
-                    {
-                        childrenList.clear();
-                        return childrenList;
-                    }
-
-                    childrenList.push_back(std::move(n));
-                }
-                else  // -> node loaded, but it isn't associated to the parent -> the node has been moved but DB isn't already updated
-                {
-                    assert(getNodeFromNodeManagerNode(itNode->second)->parentHandle() != parent->nodeHandle());
-                }
+                continue; // already added at previous loop
             }
+
+            // Skip if the Node is alive under a different parent (in-memory
+            // move not yet flushed to DB)
+            auto itNode = mNodes.find(childHandle);
+            if (itNode != mNodes.end() && itNode->second.getNodeInRam(false))
+            {
+                assert(getNodeFromNodeManagerNode(itNode->second)->parentHandle() !=
+                       parent->nodeHandle());
+                continue;
+            }
+
+            shared_ptr<Node> n(getNodeFromNodeSerialized(childSerialized));
+            if (!n)
+            {
+                childrenList.clear();
+                return childrenList;
+            }
+            childrenList.push_back(std::move(n));
         }
 
         parent->mNodePosition->second.mAllChildrenHandleLoaded = true;
