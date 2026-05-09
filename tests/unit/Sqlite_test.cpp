@@ -4,11 +4,11 @@
  *        listAllNodesByPage() cursor-based (keyset) pagination.
  */
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <mega/db/sqlite.h>
 #include <mega/localpath.h>
 
-#include <algorithm>
 #include <filesystem>
 #include <mega.h>
 #include <set>
@@ -148,10 +148,15 @@ TEST(Sqlite, MigratesOldNodesSchema)
     // close runs on every exit path (including ASSERT_* aborts).
     using SqliteHandle = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
 
+    auto openSqlite = [](const std::string& path) -> std::pair<SqliteHandle, int>
     {
         sqlite3* raw = nullptr;
-        const int openRc = sqlite3_open(dbPathStr.c_str(), &raw);
-        SqliteHandle dbGuard{raw, &sqlite3_close};
+        const int rc = sqlite3_open(path.c_str(), &raw);
+        return {SqliteHandle{raw, &sqlite3_close}, rc};
+    };
+
+    {
+        auto [dbGuard, openRc] = openSqlite(dbPathStr);
         ASSERT_EQ(SQLITE_OK, openRc);
 
         // NOTE: Keep this schema frozen — do not add or remove columns here.
@@ -176,7 +181,7 @@ TEST(Sqlite, MigratesOldNodesSchema)
                                 " counter BLOB NOT NULL,"
                                 " node BLOB NOT NULL)";
         char* err = nullptr;
-        const int rc = sqlite3_exec(raw, oldSchema, nullptr, nullptr, &err);
+        const int rc = sqlite3_exec(dbGuard.get(), oldSchema, nullptr, nullptr, &err);
         const std::string errStr = err ? err : "";
         sqlite3_free(err);
         ASSERT_EQ(SQLITE_OK, rc) << "Failed to seed old schema: " << errStr;
@@ -216,17 +221,15 @@ TEST(Sqlite, MigratesOldNodesSchema)
     ASSERT_TRUE(refDbTable);
     refDbTable.reset();
 
-    auto readColumnSet = [](const std::string& path)
+    auto readColumnSet = [&openSqlite](const std::string& path)
     {
         std::set<std::string> cols;
-        sqlite3* raw = nullptr;
-        const int openRc = sqlite3_open(path.c_str(), &raw);
-        SqliteHandle dbGuard{raw, &sqlite3_close};
+        auto [dbGuard, openRc] = openSqlite(path);
         if (openRc != SQLITE_OK)
             return cols;
         sqlite3_stmt* stmt = nullptr;
         const char* q = "SELECT name FROM pragma_table_xinfo('nodes')";
-        if (sqlite3_prepare_v2(raw, q, -1, &stmt, nullptr) == SQLITE_OK)
+        if (sqlite3_prepare_v2(dbGuard.get(), q, -1, &stmt, nullptr) == SQLITE_OK)
         {
             while (sqlite3_step(stmt) == SQLITE_ROW)
             {
@@ -240,40 +243,12 @@ TEST(Sqlite, MigratesOldNodesSchema)
     const auto migratedCols = readColumnSet(dbPathStr);
     const auto freshCols = readColumnSet(refDbLocalPath.toPath(false));
 
-    std::vector<std::string> onlyInMigrated, onlyInFresh;
-    std::set_difference(migratedCols.begin(),
-                        migratedCols.end(),
-                        freshCols.begin(),
-                        freshCols.end(),
-                        std::back_inserter(onlyInMigrated));
-    std::set_difference(freshCols.begin(),
-                        freshCols.end(),
-                        migratedCols.begin(),
-                        migratedCols.end(),
-                        std::back_inserter(onlyInFresh));
-
-    auto joinOrNone = [](const std::vector<std::string>& v)
-    {
-        if (v.empty())
-            return std::string("(none)");
-        std::string s;
-        for (const auto& c: v)
-        {
-            if (!s.empty())
-                s += ", ";
-            s += c;
-        }
-        return s;
-    };
-
     // If this fails, the CREATE TABLE DDL and the `newCols` list in
     // SqliteDbAccess::openTableWithNodes (src/db/sqlite.cpp) are out of
     // sync — such as a new column added to one but not the other. Any
     // new column must appear in both so that fresh-create and migrate
     // paths end up with identical schemas.
-    EXPECT_EQ(migratedCols, freshCols)
-        << "Only in migrated DB: " << joinOrNone(onlyInMigrated) << '\n'
-        << "Only in fresh DB:    " << joinOrNone(onlyInFresh);
+    EXPECT_THAT(migratedCols, ::testing::UnorderedElementsAreArray(freshCols));
 }
 
 #endif // USE_SQLITE
