@@ -3287,6 +3287,25 @@ using namespace mega;
     return [MEGANodeList.alloc initWithNodeList:nodeList cMemoryOwn:YES];
 }
 
+- (MEGANodeList *)listAllNodesByPageWithFilter:(MEGAListAllNodesFilter *)filter
+                                     orderType:(MEGASortOrderType)orderType
+                                   maxElements:(NSUInteger)maxElements
+                                        cursor:(nullable MEGASearchCursorOffset *)cursor
+                                   cancelToken:(MEGACancelToken *)cancelToken {
+    if (self.megaApi == nil || filter == nil) return nil;
+
+    auto cppFilter = [self generateMegaListAllNodesFilterFrom:filter];
+    auto cppCursor = [self generateMegaSearchCursorOffsetFrom:cursor];
+
+    MegaNodeList *nodeList = self.megaApi->listAllNodesByPage(cppFilter.get(),
+                                                              static_cast<int>(orderType),
+                                                              cancelToken.getCPtr,
+                                                              static_cast<size_t>(maxElements),
+                                                              cppCursor.get());
+
+    return [MEGANodeList.alloc initWithNodeList:nodeList cMemoryOwn:YES];
+}
+
 - (void)getRecentActionsAsyncSinceDays:(NSInteger)days maxNodes:(NSInteger)maxNodes excludeSensitives:(BOOL)excludeSensitives delegate:(id<MEGARequestDelegate>)delegate {
     if (self.megaApi != nil) {
         self.megaApi->getRecentActionsAsync((int)days, (unsigned int)maxNodes, excludeSensitives, [self createDelegateMEGARequestListener:delegate singleListener:YES]);
@@ -4006,6 +4025,81 @@ using namespace mega;
     return std::unique_ptr<MegaSearchPage>(
                                            MegaSearchPage::createInstance(page.startingOffset, page.pageSize)
                                            );
+}
+
+- (std::unique_ptr<MegaListAllNodesFilter>)generateMegaListAllNodesFilterFrom:(MEGAListAllNodesFilter *)filter {
+    std::unique_ptr<MegaListAllNodesFilter> megaFilter(MegaListAllNodesFilter::createInstance());
+
+    megaFilter->byCategory(static_cast<int>(filter.category));
+
+    auto buildHandleList = [](NSArray<NSNumber *> * _Nullable handles) -> std::unique_ptr<MegaHandleList> {
+        if (handles.count == 0) {
+            return nullptr;
+        }
+        std::unique_ptr<MegaHandleList> list(MegaHandleList::createInstance());
+        for (NSNumber *h in handles) {
+            // Forward unusable entries as INVALID_HANDLE so the C++ validator
+            // rejects the request (matches the documented contract on the
+            // MegaListAllNodesFilter handle setters) instead of silently
+            // dropping them.
+            if (h == nil || ![h isKindOfClass:[NSNumber class]]) {
+                list->addMegaHandle(::mega::INVALID_HANDLE);
+                continue;
+            }
+            list->addMegaHandle(static_cast<MegaHandle>(h.unsignedLongLongValue));
+        }
+        return list;
+    };
+
+    if (auto includeList = buildHandleList(filter.locationHandles)) {
+        megaFilter->byLocationHandles(includeList.get());
+    }
+
+    if (auto excludeList = buildHandleList(filter.excludeLocationHandles)) {
+        megaFilter->byExcludeLocationHandles(excludeList.get());
+    }
+
+    // byLocation is consulted only when locationHandles is empty (priority rule
+    // documented in MegaListAllNodesFilter). Forwarding it unconditionally would
+    // let an invalid `filter.location` cast void otherwise-valid locationHandles.
+    if (filter.locationHandles.count == 0) {
+        megaFilter->byLocation(static_cast<int>(filter.location));
+    }
+
+    if (filter.sensitivityFilter != MEGAListAllNodesFilterSensitivityOptionDisabled) {
+        megaFilter->bySensitivity(static_cast<int>(filter.sensitivityFilter));
+    }
+
+    return megaFilter;
+}
+
+- (std::unique_ptr<MegaSearchCursorOffset>)generateMegaSearchCursorOffsetFrom:(nullable MEGASearchCursorOffset *)cursor {
+    if (cursor == nil) {
+        return nullptr;
+    }
+
+    std::unique_ptr<MegaSearchCursorOffset> megaCursor(MegaSearchCursorOffset::createInstance());
+
+    if (cursor.lastName != nil) {
+        megaCursor->setLastName(cursor.lastName.UTF8String);
+    }
+    if (cursor.lastHandle != ::mega::INVALID_HANDLE) {
+        megaCursor->setLastHandle(cursor.lastHandle);
+    }
+    if (cursor.lastSize >= 0) {
+        megaCursor->setLastSize(cursor.lastSize);
+    }
+    if (cursor.lastMtime >= 0) {
+        megaCursor->setLastMtime(cursor.lastMtime);
+    }
+    if (cursor.lastLabel >= 0) {
+        megaCursor->setLastLabel(static_cast<int>(cursor.lastLabel));
+    }
+    if (cursor.lastFav >= 0) {
+        megaCursor->setLastFav(static_cast<int>(cursor.lastFav));
+    }
+
+    return megaCursor;
 }
 
 - (MegaUploadOptions)generateUploadOptionsFrom:(MEGAUploadOptions *)options {

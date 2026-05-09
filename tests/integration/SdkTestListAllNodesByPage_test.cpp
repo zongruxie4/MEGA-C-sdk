@@ -73,6 +73,26 @@ struct PaginationTestCase
     std::vector<std::string> page2; // expected names on page 2
 };
 
+// Builds a filter suitable for the filter-based listAllNodesByPage overload.
+// Sets byCategory to @p mimeType; leaves byLocationHandles / byLocation /
+// byExcludeLocationHandles / bySensitivity at the MegaListAllNodesFilter
+// defaults (Cloud + Vault scope, no exclusions, no sensitivity filter).
+std::unique_ptr<MegaListAllNodesFilter> makeRootnodeFilter(int mimeType)
+{
+    std::unique_ptr<MegaListAllNodesFilter> f{MegaListAllNodesFilter::createInstance()};
+    f->byCategory(mimeType);
+    return f;
+}
+
+// Build a MegaHandleList from a brace-init list of handles. Caller owns.
+std::unique_ptr<MegaHandleList> handleList(std::initializer_list<MegaHandle> handles)
+{
+    std::unique_ptr<MegaHandleList> list{MegaHandleList::createInstance()};
+    for (MegaHandle h: handles)
+        list->addMegaHandle(h);
+    return list;
+}
+
 /**
  * @brief Drives one full pagination sequence (page1 → page2 → empty) for a single test case.
  *
@@ -83,8 +103,9 @@ void checkPagination(MegaApi* api, int mimeType, const PaginationTestCase& tc, s
 {
     SCOPED_TRACE(tc.name);
 
+    auto filter = makeRootnodeFilter(mimeType);
     std::unique_ptr<MegaNodeList> page1(
-        api->listAllNodesByPage(mimeType, tc.order, nullptr, pageSize, nullptr));
+        api->listAllNodesByPage(filter.get(), tc.order, nullptr, pageSize, nullptr));
     ASSERT_NE(page1, nullptr);
     ASSERT_EQ(page1->size(), static_cast<int>(tc.page1.size()));
     EXPECT_THAT(toNames(page1.get()), ElementsAreArray(tc.page1));
@@ -94,7 +115,7 @@ void checkPagination(MegaApi* api, int mimeType, const PaginationTestCase& tc, s
     ASSERT_NE(lastOfPage1, nullptr);
     auto cursor1 = makeCursor(lastOfPage1, tc.order);
     std::unique_ptr<MegaNodeList> page2(
-        api->listAllNodesByPage(mimeType, tc.order, nullptr, pageSize, cursor1.get()));
+        api->listAllNodesByPage(filter.get(), tc.order, nullptr, pageSize, cursor1.get()));
     ASSERT_NE(page2, nullptr);
     ASSERT_EQ(page2->size(), static_cast<int>(tc.page2.size()));
     EXPECT_THAT(toNames(page2.get()), ElementsAreArray(tc.page2));
@@ -104,7 +125,7 @@ void checkPagination(MegaApi* api, int mimeType, const PaginationTestCase& tc, s
     ASSERT_NE(lastOfPage2, nullptr);
     auto cursor2 = makeCursor(lastOfPage2, tc.order);
     std::unique_ptr<MegaNodeList> page3(
-        api->listAllNodesByPage(mimeType, tc.order, nullptr, pageSize, cursor2.get()));
+        api->listAllNodesByPage(filter.get(), tc.order, nullptr, pageSize, cursor2.get()));
     ASSERT_NE(page3, nullptr);
     EXPECT_EQ(page3->size(), 0);
 }
@@ -184,8 +205,9 @@ TEST_F(SdkTestListAllNodesByPage, MimeFilter_AllResults)
     for (const auto& tc: kCases)
     {
         SCOPED_TRACE(tc.name);
+        auto filter = makeRootnodeFilter(tc.mimeType);
         std::unique_ptr<MegaNodeList> results(
-            megaApi[0]->listAllNodesByPage(tc.mimeType, tc.order, nullptr, 0, nullptr));
+            megaApi[0]->listAllNodesByPage(filter.get(), tc.order, nullptr, 0, nullptr));
         ASSERT_NE(results, nullptr);
         EXPECT_THAT(toNames(results.get()), ElementsAreArray(tc.expected));
     }
@@ -229,11 +251,27 @@ TEST_F(SdkTestListAllNodesByPage, InvalidInputs_ReturnEmpty)
 {
     auto expectEmpty = [&](int mimeType, int order, MegaSearchCursorOffset* cursor)
     {
+        auto filter = makeRootnodeFilter(mimeType);
         std::unique_ptr<MegaNodeList> r(
-            megaApi[0]->listAllNodesByPage(mimeType, order, nullptr, 0, cursor));
+            megaApi[0]->listAllNodesByPage(filter.get(), order, nullptr, 0, cursor));
         ASSERT_NE(r, nullptr);
         EXPECT_EQ(r->size(), 0);
     };
+
+    // ── nullptr filter ────────────────────────────────────────────────────────
+    // buildListAllParams returns nullopt → MegaApiImpl returns an empty
+    // MegaNodeList rather than crashing. Pin the public-API contract.
+    {
+        SCOPED_TRACE("nullptr filter");
+        std::unique_ptr<MegaNodeList> r(
+            megaApi[0]->listAllNodesByPage(static_cast<MegaListAllNodesFilter*>(nullptr),
+                                           MegaApi::ORDER_DEFAULT_ASC,
+                                           nullptr,
+                                           0,
+                                           nullptr));
+        ASSERT_NE(r, nullptr) << "API must return a non-null empty list, not crash";
+        EXPECT_EQ(r->size(), 0);
+    }
 
     // ── Invalid MIME types ────────────────────────────────────────────────────
     // mimeType <= FILE_TYPE_DEFAULT (0), > FILE_TYPE_LAST, or negative are all disallowed.
@@ -303,4 +341,326 @@ TEST_F(SdkTestListAllNodesByPage, InvalidInputs_ReturnEmpty)
         tc.setup(cursor.get());
         expectEmpty(MegaApi::FILE_TYPE_PHOTO, tc.order, cursor.get());
     }
+}
+
+// ─── Group 4: Legacy 5-arg API forwards to filter overload ───────────────────
+//
+// The 5-arg legacy overload internally constructs a MegaListAllNodesFilter with
+// byCategory(mimeType) only — the default (unset) byLocationHandle implicitly
+// applies the Cloud + Vault rootnode scope. A single-page equality assertion
+// is enough; cursor behaviour is covered by checkPagination() which runs
+// against the filter overload directly on the same dataset.
+// pageSize=2 (rather than 0/unbounded) keeps the implicit LIMIT path on the
+// legacy overload covered; both calls then return the same first-page slice.
+
+TEST_F(SdkTestListAllNodesByPage, LegacyApi_ForwardsToFilter)
+{
+    const int mimeType = MegaApi::FILE_TYPE_PHOTO;
+    const int order = MegaApi::ORDER_DEFAULT_ASC;
+    const size_t pageSize = 2;
+
+    std::unique_ptr<MegaNodeList> legacy(
+        megaApi[0]->listAllNodesByPage(mimeType, order, nullptr, pageSize, nullptr));
+
+    auto filter = makeRootnodeFilter(mimeType);
+    std::unique_ptr<MegaNodeList> modern(
+        megaApi[0]->listAllNodesByPage(filter.get(), order, nullptr, pageSize, nullptr));
+
+    ASSERT_NE(legacy, nullptr);
+    ASSERT_NE(modern, nullptr);
+    EXPECT_THAT(toNames(legacy.get()), ElementsAreArray(toNames(modern.get())));
+}
+
+// ─── Group 5: Filter API — sub-folder scope and bySensitivity ────────────────
+//
+// (Moved up from former Group 7. Former Group 5 — single-handle byLocationHandles
+// equal to testRoot — was removed: it asserted the default-scope full set on a
+// flat fixture, fully covered by Groups 7-8 below in the nested-tree fixture
+// and by Sqlite_test.cpp::ExplicitAncestor_CloudHandle_OnlyCloudNodesReturned
+// at the SQL layer.)
+//
+// A separate fixture with a nested tree and sensitive nodes so the byCategory
+// dataset of SdkTestListAllNodesByPage stays flat. This suite exercises:
+//   - byLocationHandle pointing at a strict descendant of the test root, so the
+//     result set is genuinely narrower than the default Cloud+Vault scope.
+//   - bySensitivity SENSITIVITY_HIDE_SENSITIVE, covering both own-flag
+//     exclusion and ancestor-flag inheritance.
+//
+// Node tree:
+//
+//   outer.jpg                  PHOTO   sensitive=false
+//   sensitive_top.jpg          PHOTO   sensitive=true   (own flag)
+//   sub_normal/                DIR     sensitive=false
+//     inner1.jpg               PHOTO   sensitive=false
+//     inner2.jpg               PHOTO   sensitive=false
+//   sub_sensitive/             DIR     sensitive=true
+//     sub_inherited.jpg        PHOTO   sensitive=false  (inherits from parent)
+
+class SdkTestListAllNodesByPageScope: public SdkTestNodesSetUp
+{
+    const std::vector<NodeInfo>& getElements() const override
+    {
+        static const std::vector<NodeInfo> ELEMENTS{
+            FileNodeInfo("outer.jpg"),
+            FileNodeInfo("sensitive_top.jpg").setSensitive(true),
+            DirNodeInfo("sub_normal")
+                .addChild(FileNodeInfo("inner1.jpg"))
+                .addChild(FileNodeInfo("inner2.jpg")),
+            DirNodeInfo("sub_sensitive")
+                .setSensitive(true)
+                .addChild(FileNodeInfo("sub_inherited.jpg")),
+        };
+        return ELEMENTS;
+    }
+
+    const std::string& getRootTestDir() const override
+    {
+        static const std::string dirName{"SDK_TEST_LISTALLNODESBYPAGE_SCOPE"};
+        return dirName;
+    }
+
+    bool keepDifferentCreationTimes() override
+    {
+        return false;
+    }
+};
+
+// byLocationHandles={sub_normal} must restrict the result set to that
+// sub-folder's photos only — narrower than the default Cloud+Vault scope which
+// would also include outer.jpg, sensitive_top.jpg, and sub_inherited.jpg.
+
+TEST_F(SdkTestListAllNodesByPageScope, FilterApi_ByLocationHandles_NarrowerSubFolder)
+{
+    const std::unique_ptr<MegaNode> subNormal(
+        megaApi[0]->getNodeByPath(convertToTestPath("sub_normal").c_str()));
+    ASSERT_NE(subNormal, nullptr);
+
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+    auto includes = handleList({subNormal->getHandle()});
+    filter->byLocationHandles(includes.get());
+
+    std::unique_ptr<MegaNodeList> results(megaApi[0]->listAllNodesByPage(filter.get(),
+                                                                         MegaApi::ORDER_DEFAULT_ASC,
+                                                                         nullptr,
+                                                                         0,
+                                                                         nullptr));
+    ASSERT_NE(results, nullptr);
+    EXPECT_THAT(toNames(results.get()), ElementsAreArray({"inner1.jpg", "inner2.jpg"}));
+}
+
+// bySensitivity SENSITIVITY_HIDE_SENSITIVE must drop nodes whose own flag is
+// set (sensitive_top.jpg) and nodes inheriting a sensitive strict ancestor
+// below the matched root (sub_inherited.jpg under sub_sensitive).
+
+TEST_F(SdkTestListAllNodesByPageScope, FilterApi_BySensitivity_ExcludeSensitive)
+{
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+    filter->bySensitivity(MegaListAllNodesFilter::SENSITIVITY_HIDE_SENSITIVE);
+
+    std::unique_ptr<MegaNodeList> results(megaApi[0]->listAllNodesByPage(filter.get(),
+                                                                         MegaApi::ORDER_DEFAULT_ASC,
+                                                                         nullptr,
+                                                                         0,
+                                                                         nullptr));
+    ASSERT_NE(results, nullptr);
+    EXPECT_THAT(toNames(results.get()),
+                ElementsAreArray({"inner1.jpg", "inner2.jpg", "outer.jpg"}));
+}
+
+// ─── Group 6: Filter API — byLocationHandles (multiple handles) ──────────────
+//
+// End-to-end path coverage for the list-form replacement of byLocationHandle.
+// Confirms the wire-up MegaApi → buildListAllParams → resolveListAllRoots →
+// SQL bind loop works for two ancestors at once. Nested-tree fixture so
+// sub_normal and sub_sensitive yield distinct, observable subsets.
+
+TEST_F(SdkTestListAllNodesByPageScope, FilterApi_ByLocationHandles_TwoAncestors_PathCoverage)
+{
+    const std::unique_ptr<MegaNode> subNormal(
+        megaApi[0]->getNodeByPath(convertToTestPath("sub_normal").c_str()));
+    const std::unique_ptr<MegaNode> subSensitive(
+        megaApi[0]->getNodeByPath(convertToTestPath("sub_sensitive").c_str()));
+    ASSERT_NE(subNormal, nullptr);
+    ASSERT_NE(subSensitive, nullptr);
+
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+    auto includes = handleList({subNormal->getHandle(), subSensitive->getHandle()});
+    filter->byLocationHandles(includes.get());
+
+    std::unique_ptr<MegaNodeList> results(megaApi[0]->listAllNodesByPage(filter.get(),
+                                                                         MegaApi::ORDER_DEFAULT_ASC,
+                                                                         nullptr,
+                                                                         0,
+                                                                         nullptr));
+    ASSERT_NE(results, nullptr);
+    EXPECT_THAT(toNames(results.get()),
+                ElementsAreArray({"inner1.jpg", "inner2.jpg", "sub_inherited.jpg"}))
+        << "union of sub_normal and sub_sensitive subtrees expected; outer.jpg / "
+           "sensitive_top.jpg must NOT appear because they are not under either ancestor";
+}
+
+// ─── Group 7: Filter API — byExcludeLocationHandles ──────────────────────────
+//
+// End-to-end path coverage for the new exclude list. Excluding sub_normal at
+// the API surface must reach the SQL excSeen accumulator: every descendant of
+// sub_normal (inner1.jpg, inner2.jpg) is dropped while the rest of the tree
+// remains.
+
+TEST_F(SdkTestListAllNodesByPageScope, FilterApi_ByExcludeLocationHandles_PathCoverage)
+{
+    const std::unique_ptr<MegaNode> subNormal(
+        megaApi[0]->getNodeByPath(convertToTestPath("sub_normal").c_str()));
+    ASSERT_NE(subNormal, nullptr);
+
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+    auto excludes = handleList({subNormal->getHandle()});
+    filter->byExcludeLocationHandles(excludes.get());
+
+    std::unique_ptr<MegaNodeList> results(megaApi[0]->listAllNodesByPage(filter.get(),
+                                                                         MegaApi::ORDER_DEFAULT_ASC,
+                                                                         nullptr,
+                                                                         0,
+                                                                         nullptr));
+    ASSERT_NE(results, nullptr);
+    const auto names = toNames(results.get());
+    EXPECT_THAT(names, Not(Contains(std::string("inner1.jpg"))));
+    EXPECT_THAT(names, Not(Contains(std::string("inner2.jpg"))));
+    EXPECT_THAT(names, Contains(std::string("outer.jpg")))
+        << "Sibling files outside the excluded folder must remain";
+    EXPECT_THAT(names, Contains(std::string("sub_inherited.jpg")))
+        << "Other subtrees must remain unaffected";
+}
+
+// ─── Group 8: Filter API — byLocation scope selector ─────────────────────────
+//
+// End-to-end path coverage for byLocation. Three values map to three distinct
+// rootnode sets at the NodeManager layer; here we pin the public-API path.
+// The Cloud-only mode is the user-visible answer to "exclude My Backups".
+
+TEST_F(SdkTestListAllNodesByPageScope, FilterApi_ByLocation_CloudDriveOnly_PathCoverage)
+{
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+    filter->byLocation(MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE);
+
+    std::unique_ptr<MegaNodeList> results(megaApi[0]->listAllNodesByPage(filter.get(),
+                                                                         MegaApi::ORDER_DEFAULT_ASC,
+                                                                         nullptr,
+                                                                         0,
+                                                                         nullptr));
+    ASSERT_NE(results, nullptr);
+    // Sanity: at least one of the fixture's Cloud-Drive photos must be returned.
+    // Vault content cannot be asserted here because the integration fixture does
+    // not provision Vault rootnodes via SDS — covered exhaustively in
+    // tests/unit/Sqlite_test.cpp::ListAllNodesByPageTest.LocationScope_*.
+    EXPECT_GT(results->size(), 0)
+        << "Cloud-Drive-scoped query must return the fixture's Cloud photos";
+}
+
+// ─── Group 9: Filter API — boundary / validation ─────────────────────────────
+//
+// All boundary cases pin the contract that buildListAllParams validation kicks
+// in BEFORE any DB work — the public API returns an empty MegaNodeList instead
+// of crashing or running a partially-valid query. Per Phase 2 plan, SQL
+// semantics correctness is covered exhaustively in the unit tests.
+
+// Consolidated reject-path test. All five inputs trip buildListAllParams
+// validation: oversize include / exclude lists (>MAX_LOCATION_HANDLES), an
+// INVALID_HANDLE entry in either list, and an out-of-range byLocation enum.
+// All cases must return a non-null empty MegaNodeList. Bundled into one
+// TEST_F to avoid paying the integration fixture login + tree setup cost
+// (~40s) per case — mirrors the existing InvalidInputs_ReturnEmpty pattern.
+TEST_F(SdkTestListAllNodesByPageScope, Boundary_RejectInvalidInputs_ReturnEmpty)
+{
+    const std::unique_ptr<MegaNode> rootDir(getRootTestDirectory()->copy());
+    ASSERT_NE(rootDir, nullptr);
+
+    auto expectEmpty =
+        [&](const char* label, const std::function<void(MegaListAllNodesFilter*)>& configure)
+    {
+        SCOPED_TRACE(label);
+        std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+        filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+        configure(filter.get());
+
+        std::unique_ptr<MegaNodeList> results(
+            megaApi[0]->listAllNodesByPage(filter.get(),
+                                           MegaApi::ORDER_DEFAULT_ASC,
+                                           nullptr,
+                                           0,
+                                           nullptr));
+        ASSERT_NE(results, nullptr);
+        EXPECT_EQ(results->size(), 0);
+    };
+
+    // 1. byLocationHandles size > MAX_LOCATION_HANDLES (=3) → rejected.
+    expectEmpty("oversize byLocationHandles (4 entries)",
+                [&](MegaListAllNodesFilter* f)
+                {
+                    auto inc = handleList({rootDir->getHandle(),
+                                           rootDir->getHandle(),
+                                           rootDir->getHandle(),
+                                           rootDir->getHandle()});
+                    f->byLocationHandles(inc.get());
+                });
+
+    // 2. byExcludeLocationHandles size > MAX_LOCATION_HANDLES → rejected.
+    expectEmpty("oversize byExcludeLocationHandles (4 entries)",
+                [&](MegaListAllNodesFilter* f)
+                {
+                    auto exc = handleList({rootDir->getHandle(),
+                                           rootDir->getHandle(),
+                                           rootDir->getHandle(),
+                                           rootDir->getHandle()});
+                    f->byExcludeLocationHandles(exc.get());
+                });
+
+    // 3. INVALID_HANDLE in include list → rejected.
+    expectEmpty("INVALID_HANDLE in byLocationHandles",
+                [&](MegaListAllNodesFilter* f)
+                {
+                    auto inc = handleList({INVALID_HANDLE});
+                    f->byLocationHandles(inc.get());
+                });
+
+    // 4. INVALID_HANDLE in exclude list → rejected.
+    expectEmpty("INVALID_HANDLE in byExcludeLocationHandles",
+                [&](MegaListAllNodesFilter* f)
+                {
+                    auto exc = handleList({INVALID_HANDLE});
+                    f->byExcludeLocationHandles(exc.get());
+                });
+
+    // 5. byLocation outside the LOCATION_* enum range → rejected.
+    expectEmpty("byLocation out of range (99)",
+                [&](MegaListAllNodesFilter* f)
+                {
+                    f->byLocation(99);
+                });
+}
+
+TEST_F(SdkTestListAllNodesByPageScope, Boundary_NullHandleLists_AreEquivalentToUnset)
+{
+    // Pass nullptr to either list setter — must behave exactly like never
+    // calling the setter (default scope, no exclusions).
+    std::unique_ptr<MegaListAllNodesFilter> filter{MegaListAllNodesFilter::createInstance()};
+    filter->byCategory(MegaApi::FILE_TYPE_PHOTO);
+    filter->byLocationHandles(nullptr);
+    filter->byExcludeLocationHandles(nullptr);
+
+    std::unique_ptr<MegaNodeList> results(megaApi[0]->listAllNodesByPage(filter.get(),
+                                                                         MegaApi::ORDER_DEFAULT_ASC,
+                                                                         nullptr,
+                                                                         0,
+                                                                         nullptr));
+    ASSERT_NE(results, nullptr);
+    // Default Cloud+Vault scope returns the entire fixture tree (4 photos).
+    EXPECT_THAT(
+        toNames(results.get()),
+        ElementsAreArray(
+            {"inner1.jpg", "inner2.jpg", "outer.jpg", "sensitive_top.jpg", "sub_inherited.jpg"}));
 }

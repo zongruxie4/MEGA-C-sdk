@@ -26,6 +26,8 @@
 #include "mega/megaclient.h"
 #include "mega/share.h"
 
+#include <algorithm>
+
 namespace mega {
 
 NodeManager::NoKeyLogger NodeManager::mNoKeyLogger{};
@@ -844,41 +846,62 @@ sharedNode_vector NodeManager::searchNodes_internal(const NodeSearchFilter& filt
     return nodes;
 }
 
-sharedNode_vector
-    NodeManager::listAllNodesByPage(MimeType_t mimeType,
-                                    int order,
-                                    CancelToken cancelFlag,
-                                    size_t maxElements,
-                                    const std::optional<NodeSearchCursorOffset>& cursor)
+sharedNode_vector NodeManager::listAllNodesByPage(const ListAllNodesParams& params,
+                                                  CancelToken cancelFlag)
 {
     LockGuard g(mMutex);
-    return listAllNodesByPage_internal(mimeType, order, cancelFlag, maxElements, cursor);
-}
 
-sharedNode_vector
-    NodeManager::listAllNodesByPage_internal(MimeType_t mimeType,
-                                             int order,
-                                             CancelToken cancelFlag,
-                                             size_t maxElements,
-                                             const std::optional<NodeSearchCursorOffset>& cursor)
-{
-    assert(mMutex.owns_lock());
-
-    // validation
     if (!mTable || mNodes.empty())
     {
         assert(mTable && !mNodes.empty());
         return sharedNode_vector();
     }
 
+    const std::vector<NodeHandle> filesRoots = resolveListAllRoots(params);
+    if (filesRoots.empty())
+    {
+        // Either rootnodes not yet populated (login incomplete / folder-link not
+        // attached) or caller passed no valid ancestor.
+        LOG_warn << "listAllNodesByPage: no valid root resolved (explicitAncestors size="
+                 << params.explicitAncestors.size() << ", locationScope=" << params.locationScope
+                 << "); returning empty";
+        return sharedNode_vector();
+    }
+
     vector<pair<NodeHandle, NodeSerialized>> nodesFromTable;
-    if (!mTable
-             ->listAllNodesByPage(mimeType, order, nodesFromTable, cancelFlag, maxElements, cursor))
+    if (!mTable->listAllNodesByPage(params, filesRoots, nodesFromTable, cancelFlag))
     {
         return sharedNode_vector();
     }
 
     return processUnserializedNodes(nodesFromTable, cancelFlag);
+}
+
+std::vector<NodeHandle> NodeManager::resolveListAllRoots(const ListAllNodesParams& params) const
+{
+    assert(mMutex.owns_lock());
+    // byLocationHandles wins: explicit ancestor list → use it verbatim.
+    if (!params.explicitAncestors.empty())
+    {
+        return params.explicitAncestors;
+    }
+
+    if (params.locationScope < 0 || params.locationScope > 2)
+    {
+        LOG_warn << "resolveListAllRoots: invalid locationScope " << params.locationScope
+                 << "; rejecting request";
+        return {};
+    }
+    std::vector<NodeHandle> roots;
+    if (!rootnodes.files.isUndef())
+        roots.push_back(rootnodes.files);
+    if (params.locationScope >= 1 /* LOCATION_CLOUD_DRIVE_AND_VAULT */
+        && !rootnodes.vault.isUndef())
+        roots.push_back(rootnodes.vault);
+    if (params.locationScope >= 2 /* LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH */
+        && !rootnodes.rubbish.isUndef())
+        roots.push_back(rootnodes.rubbish);
+    return roots;
 }
 
 sharedNode_vector NodeManager::getNodesWithInShares()
@@ -1376,7 +1399,10 @@ NodeCounter NodeManager::calculateNodeCounter(const NodeHandle& nodehandle, node
             return nc;
         }
         std::bitset<Node::FLAGS_SIZE> bitset(flags);
-        flags = Node::getDBFlags(flags, isInRubbish, parentType == FILENODE, bitset.test(Node::FLAGS_IS_MARKED_SENSTIVE));
+        flags = Node::getDBFlags(flags,
+                                 isInRubbish,
+                                 parentType == FILENODE,
+                                 bitset.test(Node::FLAGS_IS_MARKED_SENSITIVE));
     }
 
     std::map<NodeHandle, NodeManagerNode*>* children = nullptr;

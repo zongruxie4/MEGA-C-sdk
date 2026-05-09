@@ -138,6 +138,7 @@ class NodeSearchFilter;
 class NodeSearchPage;
 struct NodeSearchLexicographicalOffset;
 struct NodeSearchCursorOffset;
+struct ListAllNodesParams;
 
 class MEGA_API DBTableNodes
 {
@@ -231,35 +232,39 @@ public:
     virtual void updateCounterAndFlags(NodeHandle nodeHandle, uint64_t flags, const std::string& nodeCounterBlob) = 0;
 
     /**
-     * @brief List all nodes (or all nodes of a specific MIME type) using cursor-based pagination.
+     * @brief List one page of matching nodes via cursor-based pagination.
      *
-     * Unlike searchNodes() which traverses subtrees via recursive CTEs, this
-     * method issues a simple flat query against the entire nodes table.  It is intended for mobile
-     * use-cases that need stable, skip-free pagination over all nodes sorted by one of the
-     * supported criteria.
+     * Flat query against the nodes table; results are restricted to
+     * @p filesRoots via an EXISTS up-walk. Versions are always excluded.
+     * Intended for stable, skip-free pagination sorted by one of the
+     * MegaApi::ORDER_* constants supported by this query path
+     * (DEFAULT, SIZE, MODIFICATION, LABEL, FAV — both ASC and DESC).
      *
-     * Supported sort orders (same constants as MegaApi::ORDER_*):
-     *   ORDER_DEFAULT_ASC      / ORDER_DEFAULT_DESC
-     *   ORDER_SIZE_ASC         / ORDER_SIZE_DESC
-     *   ORDER_MODIFICATION_ASC / ORDER_MODIFICATION_DESC
-     *   ORDER_LABEL_ASC        / ORDER_LABEL_DESC
-     *   ORDER_FAV_ASC          / ORDER_FAV_DESC
-     *
-     * @param mimeType    MIME type filter (must not be MIME_TYPE_UNKNOWN).
-     * @param order       One of the ORDER_* constants listed above.
-     * @param nodes       Output vector of (handle, serialised-node) pairs.
+     * @param params      Filter + pagination state — see ListAllNodesParams.
+     *                    explicitAncestors / locationScope are resolved by
+     *                    NodeManager and arrive here as @p filesRoots.
+     * @param filesRoots  1..kListAllMaxLocationHandles ancestor handles, all
+     *                    non-UNDEF. A node is included iff its ancestor
+     *                    chain reaches ANY entry.
+     * @param nodes       Output (handle, serialised-node) pairs.
      * @param cancelFlag  Cancellation token.
-     * @param maxElements Page size (0 = no limit).
-     * @param cursor      Cursor derived from the last node of the previous page, or std::nullopt
-     *                    for the first page.
-     * @return true on success, false on DB error.
+     * @return true on success, false on DB error or invalid inputs:
+     *         params.mimeType is MIME_TYPE_UNKNOWN; @p filesRoots is empty,
+     *         oversized, or contains UNDEF; params.excludeHandles is
+     *         oversized or contains UNDEF.
+     *
+     * Filter semantics applied here:
+     *   - excludeSensitive: drop a node when its own flag OR any strict
+     *     ancestor (walking up below the matched root) has
+     *     FLAGS_IS_MARKED_SENSITIVE. The matched root's own flag is ignored.
+     *   - excludeHandles: drop a node when any handle in the list appears
+     *     anywhere in its ancestor chain (inclusive of the node and the
+     *     matched root).
      */
-    virtual bool listAllNodesByPage(MimeType_t mimeType,
-                                    int order,
+    virtual bool listAllNodesByPage(const ListAllNodesParams& params,
+                                    const std::vector<NodeHandle>& filesRoots,
                                     std::vector<std::pair<NodeHandle, NodeSerialized>>& nodes,
-                                    CancelToken cancelFlag,
-                                    size_t maxElements,
-                                    const std::optional<NodeSearchCursorOffset>& cursor) = 0;
+                                    CancelToken cancelFlag) = 0;
 
     virtual void createIndexes(bool enableIndexesForSearching,
                                bool enableIndexesForLexicographicalList) = 0;

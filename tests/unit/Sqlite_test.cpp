@@ -120,6 +120,50 @@ namespace fs = std::filesystem;
 namespace
 {
 
+// Convenience helper for building ListAllNodesParams in tests. Defaults to the
+// "Cloud + Vault" scope (explicitAncestors empty, locationScope = 1); tests
+// that exercise a specific subtree pass one or more explicit ancestor handles.
+ListAllNodesParams makeParams(MimeType_t mime,
+                              int order,
+                              size_t maxElements,
+                              bool excludeSensitive = false,
+                              std::optional<NodeSearchCursorOffset> cursor = std::nullopt,
+                              std::vector<NodeHandle> explicitAncestors = {},
+                              std::vector<NodeHandle> excludeHandles = {},
+                              int locationScope = 1)
+{
+    ListAllNodesParams p;
+    p.mimeType = mime;
+    p.order = order;
+    p.maxElements = maxElements;
+    p.excludeSensitive = excludeSensitive;
+    p.cursor = std::move(cursor);
+    p.explicitAncestors = std::move(explicitAncestors);
+    p.excludeHandles = std::move(excludeHandles);
+    p.locationScope = locationScope;
+    return p;
+}
+
+// Collect the handles from a NodeManager-layer result (sharedNode_vector) into
+// a std::set for set-membership assertions. Unordered semantics, dedupes
+// duplicates if any. Used by Group G filter-semantics tests.
+std::set<NodeHandle> handlesOf(const sharedNode_vector& nodes)
+{
+    std::set<NodeHandle> result;
+    for (const auto& n: nodes)
+        result.insert(n->nodeHandle());
+    return result;
+}
+
+// DbTable-layer overload: rows are (handle, serialised) pairs.
+std::set<NodeHandle> handlesOf(const std::vector<std::pair<NodeHandle, NodeSerialized>>& rows)
+{
+    std::set<NodeHandle> result;
+    for (const auto& p: rows)
+        result.insert(p.first);
+    return result;
+}
+
 // ─── Per-node metadata captured at insertion time ────────────────────────────
 // Used to build NodeSearchCursorOffset without relying on attribute decryption.
 struct NodeMeta
@@ -130,6 +174,7 @@ struct NodeMeta
     int64_t mtime = 0;
     int label = 0; ///< 0 = unlabelled, 1-7 = colour
     int fav = 0; ///< 0 or 1
+    bool sensitive = false; ///< sets the "sen" attribute when true
 };
 
 // Attribute name IDs used across multiple test fixtures and test cases.
@@ -172,6 +217,14 @@ protected:
     static constexpr int NUM_FILES = 20;
     static constexpr int NUM_FOLDERS = 5;
 
+    // Handles exposed for the Cloud-Drive / version / sensitive filter tests.
+    // These reference the jpg + Vault/Rubbish subtrees built by populateDB().
+    NodeHandle hFilesRoot; // alias of mRootHandle, kept for readability
+    NodeHandle hVault, hRubbish;
+    NodeHandle hNormalFolder, hSensFolder;
+    NodeHandle hClean, hSelfSensitive, hHead, hVersionV1, hVersionV2, hUnderSens;
+    NodeHandle hVaultFile, hRubbishFile;
+
     void SetUp() override
     {
         mTestDir = fs::current_path() / "search_by_page_test";
@@ -200,9 +253,16 @@ protected:
     }
 
     // ── Low-level node factory ────────────────────────────────────────────────
+    //
+    // `isFetching` is forwarded to NodeManager::addNode and defaults to true
+    // (historical behaviour). Pass false when building subtrees whose
+    // relationships must survive in RAM — notably file-version chains, whose
+    // FLAGS_IS_VERSION bit requires the immediate parent pointer to stay live
+    // instead of being evicted through the single-slot mNodeToWriteInDb buffer.
     std::shared_ptr<Node> addNode(nodetype_t type,
                                   std::shared_ptr<Node> parent,
-                                  const NodeMeta& meta)
+                                  const NodeMeta& meta,
+                                  bool isFetching = true)
     {
         NodeHandle h = NodeHandle().set6byte(mNextHandle++);
         Node& ref = mt::makeNode(*mClient, type, h, parent.get());
@@ -235,9 +295,12 @@ protected:
         if (meta.label > 0)
             node->attrs.map[kLabelId] = std::to_string(meta.label);
 
+        if (meta.sensitive)
+            node->attrs.map[AttrMap::string2nameid("sen")] = "1";
+
         mClient->mNodeManager.addNode(node,
                                       /*notify=*/false,
-                                      /*isFetching=*/true,
+                                      isFetching,
                                       mMissingParentNodes);
         mClient->mNodeManager.saveNodeInDb(node.get());
 
@@ -247,11 +310,33 @@ protected:
     }
 
     // ── Dataset construction ──────────────────────────────────────────────────
+    //
+    // Builds the shared base dataset used by every SearchByPageTest subclass:
+    //
+    //   CloudDrive (ROOTNODE, mRootHandle/hFilesRoot)
+    //   ├── Folder_A..E                           (5 folders)
+    //   ├── file_01.txt .. file_20.txt            (20 documents)
+    //   ├── normal_folder/                        (non-sensitive)
+    //   │   ├── clean.jpg
+    //   │   ├── self_sensitive.jpg   [sen=1]
+    //   │   └── head.jpg                          (HEAD)
+    //   │       ├── head.jpg         (version v1, FILENODE child of FILENODE)
+    //   │       └── head.jpg         (version v2)
+    //   └── sens_folder/             [sen=1]      (sensitive ancestor)
+    //       └── under_sens.jpg
+    //   Vault (VAULTNODE) / vault_file.jpg
+    //   Rubbish (RUBBISHNODE) / rubbish_file.jpg
+    //
+    // The .jpg / Vault / Rubbish additions are transparent to pagination tests
+    // that query single-mime DOCUMENT — Vault/Rubbish roots fall outside the
+    // Cloud-Drive-rooted filter, jpg files don't match MIME_TYPE_DOCUMENT, and
+    // version children are always excluded by listAllNodesByPage.
     virtual void populateDB()
     {
         NodeMeta rootMeta{"ROOT", ROOTNODE, 0, 0, 0, 0};
         auto root = addNode(ROOTNODE, nullptr, rootMeta);
         mRootHandle = root->nodeHandle();
+        hFilesRoot = mRootHandle;
 
         const std::string alpha = "ABCDE";
         for (int i = 0; i < NUM_FOLDERS; ++i)
@@ -275,6 +360,92 @@ protected:
             fm.fav = (i % 5 == 0) ? 1 : 0;
             addNode(FILENODE, root, fm);
         }
+
+        // Vault + Rubbish roots. NodeManager auto-registers them via
+        // setrootnode_internal so the rootnodes.{vault,rubbish} columns are set.
+        auto vault = addNode(VAULTNODE,
+                             nullptr,
+                             NodeMeta{"Vault", VAULTNODE},
+                             /*isFetching=*/false);
+        auto rubbish = addNode(RUBBISHNODE,
+                               nullptr,
+                               NodeMeta{"Rubbish", RUBBISHNODE},
+                               /*isFetching=*/false);
+        hVault = vault->nodeHandle();
+        hRubbish = rubbish->nodeHandle();
+
+        // Folders under Cloud Drive root. sens_folder carries the SENS bit so
+        // its descendants must be filtered out when excludeSensitive=true.
+        NodeMeta sensFolderMeta{"sens_folder", FOLDERNODE};
+        sensFolderMeta.sensitive = true;
+        auto normal = addNode(FOLDERNODE,
+                              root,
+                              NodeMeta{"normal_folder", FOLDERNODE},
+                              /*isFetching=*/false);
+        auto sens = addNode(FOLDERNODE, root, sensFolderMeta, /*isFetching=*/false);
+        hNormalFolder = normal->nodeHandle();
+        hSensFolder = sens->nodeHandle();
+
+        const int64_t baseMtime = 1'800'000'000LL;
+
+        // isFetching=false keeps HEAD + version children in RAM so
+        // FLAGS_IS_VERSION can still be computed from the parent pointer.
+        hClean = addNode(FILENODE,
+                         normal,
+                         NodeMeta{"clean.jpg", FILENODE, 100, baseMtime + 1},
+                         /*isFetching=*/false)
+                     ->nodeHandle();
+
+        NodeMeta selfSensMeta{"self_sensitive.jpg", FILENODE, 200, baseMtime + 2};
+        selfSensMeta.sensitive = true;
+        hSelfSensitive =
+            addNode(FILENODE, normal, selfSensMeta, /*isFetching=*/false)->nodeHandle();
+
+        auto head = addNode(FILENODE,
+                            normal,
+                            NodeMeta{"head.jpg", FILENODE, 300, baseMtime + 3},
+                            /*isFetching=*/false);
+        hHead = head->nodeHandle();
+        hVersionV1 = addNode(FILENODE,
+                             head,
+                             NodeMeta{"head.jpg", FILENODE, 290, baseMtime + 2},
+                             /*isFetching=*/false)
+                         ->nodeHandle();
+        hVersionV2 = addNode(FILENODE,
+                             head,
+                             NodeMeta{"head.jpg", FILENODE, 280, baseMtime + 1},
+                             /*isFetching=*/false)
+                         ->nodeHandle();
+
+        hUnderSens = addNode(FILENODE,
+                             sens,
+                             NodeMeta{"under_sens.jpg", FILENODE, 400, baseMtime + 4},
+                             /*isFetching=*/false)
+                         ->nodeHandle();
+
+        hVaultFile = addNode(FILENODE,
+                             vault,
+                             NodeMeta{"vault_file.jpg", FILENODE, 500, baseMtime + 5},
+                             /*isFetching=*/false)
+                         ->nodeHandle();
+        hRubbishFile = addNode(FILENODE,
+                               rubbish,
+                               NodeMeta{"rubbish_file.jpg", FILENODE, 600, baseMtime + 6},
+                               /*isFetching=*/false)
+                           ->nodeHandle();
+    }
+
+    // Single call, no limit, no cursor — returns every distinct handle matching
+    // @p mime (after Cloud+Vault/version/optional-sensitive filtering).
+    std::set<NodeHandle> allMatchesAsSet(MimeType_t mime, int order, bool excludeSensitive) const
+    {
+        auto nodes = mClient->mNodeManager.listAllNodesByPage(
+            makeParams(mime, order, /*maxElements=*/0, excludeSensitive),
+            CancelToken{});
+        std::set<NodeHandle> out;
+        for (const auto& n: nodes)
+            out.insert(n->nodeHandle());
+        return out;
     }
 
     // ── Multi-page accumulation helper ─────────────────────────────────────────
@@ -285,7 +456,8 @@ protected:
         collectAllByPage(int order,
                          size_t pageSize,
                          MimeType_t mimeType,
-                         std::optional<NodeSearchCursorOffset> startCursor = std::nullopt) const
+                         std::optional<NodeSearchCursorOffset> startCursor = std::nullopt,
+                         bool excludeSensitive = false) const
     {
         std::vector<NodeHandle> result;
         std::optional<NodeSearchCursorOffset> cursor = startCursor;
@@ -296,11 +468,9 @@ protected:
         while (pageCount < maxPages)
         {
             ++pageCount;
-            auto page = mClient->mNodeManager.listAllNodesByPage(mimeType,
-                                                                 order,
-                                                                 CancelToken{},
-                                                                 pageSize,
-                                                                 cursor);
+            auto page = mClient->mNodeManager.listAllNodesByPage(
+                makeParams(mimeType, order, pageSize, excludeSensitive, cursor),
+                CancelToken{});
             if (page.empty())
                 break;
             for (const auto& n: page)
@@ -359,8 +529,9 @@ protected:
 /**
  * @brief Fixture for listAllNodesByPage tests.
  *
- * Inherits the dataset from SearchByPageTest (ROOT + 5 folders + 20 files)
- * and the cursorFor() helper so cursor fields are always correctly populated.
+ * Inherits the SearchByPageTest dataset (5 folders + 20 .txt files plus the
+ * shared jpg / Vault / Rubbish subtrees used by the filter tests) and the
+ * cursorFor() helper so cursor fields are always correctly populated.
  * Adds two helpers:
  *   referenceAll()    – single-call with no limit (ground truth for order / count)
  *   collectAllByPage() – multi-page accumulation (verifies no skips / duplicates)
@@ -368,17 +539,16 @@ protected:
 class ListAllNodesByPageTest: public SearchByPageTest
 {
 protected:
-    // All test files are named *.txt → MIME_TYPE_DOCUMENT.
+    // Pagination assertions target the 20 .txt files (MIME_TYPE_DOCUMENT);
+    // jpg-subtree tests pass MIME_TYPE_PHOTO explicitly.
     static constexpr MimeType_t TEST_MIME = MIME_TYPE_DOCUMENT;
 
     // Returns every node matching TEST_MIME in `order` in one call (no limit, no cursor).
     std::vector<NodeHandle> referenceAll(int order) const
     {
-        auto nodes = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                              order,
-                                                              CancelToken{},
-                                                              /*maxElements=*/0,
-                                                              std::nullopt);
+        auto nodes = mClient->mNodeManager.listAllNodesByPage(
+            makeParams(TEST_MIME, order, /*maxElements=*/0),
+            CancelToken{});
 
         std::vector<NodeHandle> result;
         result.reserve(nodes.size());
@@ -392,9 +562,81 @@ protected:
     std::vector<NodeHandle>
         collectAllByPage(int order,
                          size_t pageSize,
-                         std::optional<NodeSearchCursorOffset> startCursor = std::nullopt) const
+                         std::optional<NodeSearchCursorOffset> startCursor = std::nullopt,
+                         bool excludeSensitive = false) const
     {
-        return SearchByPageTest::collectAllByPage(order, pageSize, TEST_MIME, startCursor);
+        return SearchByPageTest::collectAllByPage(order,
+                                                  pageSize,
+                                                  TEST_MIME,
+                                                  startCursor,
+                                                  excludeSensitive);
+    }
+
+    // ── Shared body for the deletion-between-pages tests (E1, E2). ────────────
+    // Fetches page 1 of size `pageSize` under `order`, then physically removes
+    // the (pageSize+1)-th node from the DB, then walks the rest using the
+    // cursor anchored at the last item of page 1. Asserts the deleted node is
+    // absent, every reference[pageSize+1 ..] still appears, and no page-1
+    // handle reappears.
+    void runDeletionBetweenPages(int order, size_t pageSize) const
+    {
+        SCOPED_TRACE("order=" + std::to_string(order) + " pageSize=" + std::to_string(pageSize));
+
+        auto page1 =
+            mClient->mNodeManager.listAllNodesByPage(makeParams(TEST_MIME, order, pageSize),
+                                                     CancelToken{});
+        ASSERT_EQ(page1.size(), pageSize);
+
+        const auto fullReference = referenceAll(order);
+        ASSERT_EQ(fullReference.size(), static_cast<size_t>(NUM_FILES));
+
+        // Delete the (pageSize+1)-th node — the first of page 2 in offset terms.
+        const NodeHandle toDelete = fullReference[pageSize];
+        auto* sa = dynamic_cast<SqliteAccountState*>(mClient->sctable.get());
+        ASSERT_NE(sa, nullptr);
+        ASSERT_TRUE(sa->remove(toDelete)) << "failed to delete node from DB";
+
+        const auto page2Plus =
+            collectAllByPage(order, pageSize, cursorFor(page1.back()->nodeHandle(), order));
+
+        const std::set<NodeHandle> page2Set(page2Plus.begin(), page2Plus.end());
+
+        EXPECT_EQ(page2Set.count(toDelete), 0u) << "deleted node appeared in page 2+";
+
+        // Every node after the deleted one in the reference ordering must
+        // appear — this is the no-skip guarantee that cursor pagination
+        // provides regardless of the cursor predicate variant.
+        for (size_t i = pageSize + 1; i < fullReference.size(); ++i)
+        {
+            EXPECT_EQ(page2Set.count(fullReference[i]), 1u)
+                << "node at reference index " << i << " was skipped after deletion";
+        }
+
+        for (const auto& n: page1)
+        {
+            EXPECT_EQ(page2Set.count(n->nodeHandle()), 0u)
+                << "page-1 handle " << n->nodeHandle() << " repeated in page 2+";
+        }
+    }
+
+    // ── Shared body for the DbTable-level invalid-roots rejection tests. ──────
+    // G1e (empty), G1e' (UNDEF in list), G1g (size > kListAllMaxRoots) all
+    // pin the same contract: false return + empty out vector.
+    void assertDbTableRejectsRoots(const std::vector<NodeHandle>& roots,
+                                   const std::string& label) const
+    {
+        SCOPED_TRACE(label);
+        auto* table = dynamic_cast<DBTableNodes*>(mClient->sctable.get());
+        ASSERT_NE(table, nullptr);
+
+        std::vector<std::pair<NodeHandle, NodeSerialized>> out;
+        const bool ok = table->listAllNodesByPage(
+            makeParams(MIME_TYPE_PHOTO, OrderByClause::DEFAULT_ASC, /*maxElements=*/0),
+            roots,
+            out,
+            CancelToken{});
+        EXPECT_TRUE(out.empty()) << label << " must yield no rows";
+        EXPECT_FALSE(ok) << label << " must be rejected (layer contract)";
     }
 };
 
@@ -424,11 +666,9 @@ void assertListAllMatchesReference(const std::vector<NodeHandle>& paged,
 //     and returns false; the NodeManager must surface an empty vector.
 TEST_F(ListAllNodesByPageTest, UnknownMimeType_ReturnsEmpty)
 {
-    auto nodes = mClient->mNodeManager.listAllNodesByPage(MIME_TYPE_UNKNOWN,
-                                                          OrderByClause::DEFAULT_ASC,
-                                                          CancelToken{},
-                                                          10,
-                                                          std::nullopt);
+    auto nodes = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(MIME_TYPE_UNKNOWN, OrderByClause::DEFAULT_ASC, 10),
+        CancelToken{});
 
     EXPECT_TRUE(nodes.empty()) << "MIME_TYPE_UNKNOWN must return an empty result";
 }
@@ -438,11 +678,9 @@ TEST_F(ListAllNodesByPageTest, UnknownMimeType_ReturnsEmpty)
 TEST_F(ListAllNodesByPageTest, ValidMimeTypeNoMatches_ReturnsEmpty)
 {
     // Dataset contains only .txt files; MIME_TYPE_AUDIO has no matches.
-    auto nodes = mClient->mNodeManager.listAllNodesByPage(MIME_TYPE_AUDIO,
-                                                          OrderByClause::DEFAULT_ASC,
-                                                          CancelToken{},
-                                                          10,
-                                                          std::nullopt);
+    auto nodes = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(MIME_TYPE_AUDIO, OrderByClause::DEFAULT_ASC, 10),
+        CancelToken{});
 
     EXPECT_TRUE(nodes.empty()) << "MIME_TYPE_AUDIO with no matching nodes must return empty";
 }
@@ -505,11 +743,9 @@ TEST_F(ListAllNodesByPageTest, CursorOrderMismatch_ReturnsEmpty)
     for (const auto& c: cases)
     {
         auto cursor = cursorFor(midHandle, c.cursorOrder);
-        auto result = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                               c.queryOrder,
-                                                               CancelToken{},
-                                                               10,
-                                                               cursor);
+        auto result = mClient->mNodeManager.listAllNodesByPage(
+            makeParams(TEST_MIME, c.queryOrder, 10, /*excludeSensitive=*/false, cursor),
+            CancelToken{});
         EXPECT_TRUE(result.empty())
             << c.label << ": expected empty result for cursor/order mismatch";
     }
@@ -522,36 +758,55 @@ TEST_F(ListAllNodesByPageTest, CursorOrderMismatch_ReturnsEmpty)
 // B1. MIME filter excludes non-file nodes – only .txt files are returned.
 TEST_F(ListAllNodesByPageTest, NoCursor_DocumentMimeFilter_ReturnsAllFiles)
 {
-    auto nodes = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                          OrderByClause::DEFAULT_ASC,
-                                                          CancelToken{},
-                                                          /*maxElements=*/0,
-                                                          std::nullopt);
+    auto nodes = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(TEST_MIME, OrderByClause::DEFAULT_ASC, /*maxElements=*/0),
+        CancelToken{});
 
     // Dataset has NUM_FILES .txt files; folders/root have no MIME type so are excluded.
     EXPECT_EQ(nodes.size(), static_cast<size_t>(NUM_FILES));
 
-    const std::set<NodeHandle> unique(
-        [&]
-        {
-            std::vector<NodeHandle> hs;
-            for (const auto& n: nodes)
-                hs.push_back(n->nodeHandle());
-            return std::set<NodeHandle>(hs.begin(), hs.end());
-        }());
+    const auto unique = handlesOf(nodes);
     EXPECT_EQ(unique.size(), nodes.size()) << "duplicate handles in result";
 }
 
 // B2. pageSize larger than total – all results fit in one page.
 TEST_F(ListAllNodesByPageTest, PageSizeLargerThanTotal_AllInOnePage)
 {
-    auto page = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                         OrderByClause::DEFAULT_ASC,
-                                                         CancelToken{},
-                                                         1000,
-                                                         std::nullopt);
+    auto page = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(TEST_MIME, OrderByClause::DEFAULT_ASC, 1000),
+        CancelToken{});
 
     EXPECT_EQ(page.size(), static_cast<size_t>(NUM_FILES));
+}
+
+// B3. maxElements == 0 is the documented "no pagination" sentinel
+//     (sqlite.cpp maps it to LIMIT -1). Returns every matching row in a single
+//     call. Pins the contract so it cannot silently regress to "empty page".
+TEST_F(ListAllNodesByPageTest, MaxElementsZero_ReturnsAllInOnePage)
+{
+    auto page = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(TEST_MIME, OrderByClause::DEFAULT_ASC, /*maxElements=*/0),
+        CancelToken{});
+
+    EXPECT_EQ(page.size(), static_cast<size_t>(NUM_FILES));
+}
+
+// B4. Cursor past the last element with the unlimited (maxElements == 0)
+//     sentinel still terminates with an empty page.
+TEST_F(ListAllNodesByPageTest, CursorPastLastElement_MaxElementsZero_ReturnsEmpty)
+{
+    const auto reference = referenceAll(OrderByClause::DEFAULT_ASC);
+    ASSERT_FALSE(reference.empty());
+
+    auto cursor = cursorFor(reference.back(), OrderByClause::DEFAULT_ASC);
+    auto page = mClient->mNodeManager.listAllNodesByPage(makeParams(TEST_MIME,
+                                                                    OrderByClause::DEFAULT_ASC,
+                                                                    /*maxElements=*/0,
+                                                                    /*excludeSensitive=*/false,
+                                                                    cursor),
+                                                         CancelToken{});
+
+    EXPECT_TRUE(page.empty()) << "Cursor past last element with maxElements=0 must still be empty";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -708,19 +963,18 @@ TEST_F(ListAllNodesByPageTest, LabelAsc_AllTypes_LabeledBeforeUnlabeledAndNonDec
 // D1. pageSize equals total count → first page is full, second page is empty.
 TEST_F(ListAllNodesByPageTest, PageSizeEqualsTotal_SinglePage)
 {
-    auto page1 = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                          OrderByClause::DEFAULT_ASC,
-                                                          CancelToken{},
-                                                          /*maxElements=*/NUM_FILES,
-                                                          std::nullopt);
+    auto page1 = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(TEST_MIME, OrderByClause::DEFAULT_ASC, /*maxElements=*/NUM_FILES),
+        CancelToken{});
     ASSERT_EQ(page1.size(), static_cast<size_t>(NUM_FILES));
 
     auto cursor = cursorFor(page1.back()->nodeHandle(), OrderByClause::DEFAULT_ASC);
-    auto page2 = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                          OrderByClause::DEFAULT_ASC,
-                                                          CancelToken{},
-                                                          NUM_FILES,
-                                                          cursor);
+    auto page2 = mClient->mNodeManager.listAllNodesByPage(makeParams(TEST_MIME,
+                                                                     OrderByClause::DEFAULT_ASC,
+                                                                     NUM_FILES,
+                                                                     /*excludeSensitive=*/false,
+                                                                     cursor),
+                                                          CancelToken{});
 
     EXPECT_TRUE(page2.empty()) << "Page after last element must be empty";
 }
@@ -742,11 +996,9 @@ TEST_F(ListAllNodesByPageTest, CursorPastLastElement_ReturnsEmpty)
     ASSERT_FALSE(reference.empty());
 
     auto cursor = cursorFor(reference.back(), OrderByClause::DEFAULT_ASC);
-    auto page = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                         OrderByClause::DEFAULT_ASC,
-                                                         CancelToken{},
-                                                         10,
-                                                         cursor);
+    auto page = mClient->mNodeManager.listAllNodesByPage(
+        makeParams(TEST_MIME, OrderByClause::DEFAULT_ASC, 10, /*excludeSensitive=*/false, cursor),
+        CancelToken{});
 
     EXPECT_TRUE(page.empty()) << "Page after last element must be empty";
 }
@@ -802,50 +1054,7 @@ TEST_F(ListAllNodesByPageTest, DefaultAsc_DocumentMime_PaginationMatchesReferenc
 //     the cursor encodes a sort-key position, not an offset.
 TEST_F(ListAllNodesByPageTest, Deletion_BetweenPages_NoSkip)
 {
-    // Get first page (5 nodes) and save the full reference ordering.
-    auto page1 = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                          OrderByClause::DEFAULT_ASC,
-                                                          CancelToken{},
-                                                          5,
-                                                          std::nullopt);
-    ASSERT_EQ(page1.size(), 5u);
-
-    const auto fullReference = referenceAll(OrderByClause::DEFAULT_ASC);
-    ASSERT_EQ(fullReference.size(), static_cast<size_t>(NUM_FILES));
-
-    // Physically delete the 6th node from the DB (first item of page 2 in
-    // offset terms) so subsequent cursor queries never see it.
-    const NodeHandle toDelete = fullReference[5];
-    auto* sa = dynamic_cast<SqliteAccountState*>(mClient->sctable.get());
-    ASSERT_NE(sa, nullptr);
-    ASSERT_TRUE(sa->remove(toDelete)) << "failed to delete node from DB";
-
-    // Collect all remaining pages using the cursor after page 1.
-    const auto page2Plus =
-        collectAllByPage(OrderByClause::DEFAULT_ASC,
-                         5,
-                         cursorFor(page1.back()->nodeHandle(), OrderByClause::DEFAULT_ASC));
-
-    const std::set<NodeHandle> page2Set(page2Plus.begin(), page2Plus.end());
-
-    // The deleted node must not appear.
-    EXPECT_EQ(page2Set.count(toDelete), 0u) << "deleted node appeared in page 2+";
-
-    // Every node after the deleted one in the reference ordering must appear –
-    // this is the no-skip guarantee that cursor pagination provides.
-    // fullReference[0..4] = page1, [5] = deleted, [6..NUM_FILES-1] = expected in page2+.
-    for (size_t i = 6; i < fullReference.size(); ++i)
-    {
-        EXPECT_EQ(page2Set.count(fullReference[i]), 1u)
-            << "node at reference index " << i << " was skipped after deletion";
-    }
-
-    // Sanity: no page-1 handle should reappear.
-    for (const auto& n: page1)
-    {
-        EXPECT_EQ(page2Set.count(n->nodeHandle()), 0u)
-            << "page-1 handle " << n->nodeHandle() << " repeated in page 2+";
-    }
+    runDeletionBetweenPages(OrderByClause::DEFAULT_ASC, /*pageSize=*/5);
 }
 
 // E2. SizeAsc_DeletionBetweenPages_NoSkip – same guarantee as E1 but using
@@ -858,42 +1067,7 @@ TEST_F(ListAllNodesByPageTest, Deletion_BetweenPages_NoSkip)
 //     bindCursorParamsForListAll.
 TEST_F(ListAllNodesByPageTest, SizeAsc_DeletionBetweenPages_NoSkip)
 {
-    auto page1 = mClient->mNodeManager.listAllNodesByPage(TEST_MIME,
-                                                          OrderByClause::SIZE_ASC,
-                                                          CancelToken{},
-                                                          5,
-                                                          std::nullopt);
-    ASSERT_EQ(page1.size(), 5u);
-
-    const auto fullReference = referenceAll(OrderByClause::SIZE_ASC);
-    ASSERT_EQ(fullReference.size(), static_cast<size_t>(NUM_FILES));
-
-    // Delete the 6th node (first of page 2 in offset terms).
-    const NodeHandle toDelete = fullReference[5];
-    auto* sa = dynamic_cast<SqliteAccountState*>(mClient->sctable.get());
-    ASSERT_NE(sa, nullptr);
-    ASSERT_TRUE(sa->remove(toDelete)) << "failed to delete node from DB";
-
-    const auto page2Plus =
-        collectAllByPage(OrderByClause::SIZE_ASC,
-                         5,
-                         cursorFor(page1.back()->nodeHandle(), OrderByClause::SIZE_ASC));
-
-    const std::set<NodeHandle> page2Set(page2Plus.begin(), page2Plus.end());
-
-    EXPECT_EQ(page2Set.count(toDelete), 0u) << "deleted node appeared in page 2+";
-
-    // Every node after the deleted one in the SIZE_ASC ordering must appear.
-    for (size_t i = 6; i < fullReference.size(); ++i)
-    {
-        EXPECT_EQ(page2Set.count(fullReference[i]), 1u)
-            << "node at SIZE_ASC reference index " << i << " was skipped after deletion";
-    }
-
-    for (const auto& n: page1)
-    {
-        EXPECT_EQ(page2Set.count(n->nodeHandle()), 0u) << "page-1 handle repeated in page 2+";
-    }
+    runDeletionBetweenPages(OrderByClause::SIZE_ASC, /*pageSize=*/5);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -927,6 +1101,308 @@ TEST_F(ListAllNodesByPageTest, AllOrders_AllTypes_PaginationMatchesReference)
                                       "ALL order=" + std::to_string(order) +
                                           " pageSize=" + std::to_string(pageSize));
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Group G – Filter semantics (default Cloud+Vault scope / explicit ancestor /
+//            versions / sensitive)
+//
+//  Exercises the filters built on top of cursor-based pagination:
+//    1. Default scope (explicitAncestor unset): Cloud + Vault subtrees;
+//       Rubbish and inshare subtrees are always excluded.
+//    2. File versions (FILENODE whose parent is a FILENODE) are always
+//       excluded regardless of MIME filter.
+//    3. When excludeSensitive = true, nodes whose own flags or any ancestor
+//       (strictly below the matched root) carry FLAGS_IS_MARKED_SENSITIVE are
+//       filtered out. The matched root's own SENS flag is intentionally ignored.
+//
+//  MIME_TYPE_PHOTO result matrix for the shared Cloud jpg subtree:
+//    excludeSensitive=false: {clean, self_sensitive, head, under_sens}
+//    excludeSensitive=true:  {clean, head}
+//  Rubbish files and all versions never appear regardless of the flag.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// G1a. Default scope (explicitAncestor unset): Cloud + Vault included; Rubbish
+//      always excluded.
+TEST_F(ListAllNodesByPageTest, DefaultScope_IncludesVault_ExcludesRubbish)
+{
+    for (bool exSens: {false, true})
+    {
+        SCOPED_TRACE(std::string("excludeSensitive=") + (exSens ? "true" : "false"));
+        auto got = allMatchesAsSet(MIME_TYPE_PHOTO, OrderByClause::DEFAULT_ASC, exSens);
+        EXPECT_EQ(got.count(hVaultFile), 1u)
+            << "vault_file.jpg must be included under default scope";
+        EXPECT_EQ(got.count(hRubbishFile), 0u)
+            << "rubbish_file.jpg must not be included — Rubbish is excluded";
+    }
+}
+
+// G1a'. Default scope when Vault is not provisioned (rootnodes.vault is UNDEF):
+//       resolveListAllRoots must skip the UNDEF slot and fall back to Cloud-only.
+//       Models real production accounts that never materialise a Vault rootnode
+//       (folder-link sessions, password-manager-only accounts).
+TEST_F(ListAllNodesByPageTest, DefaultScope_VaultNotProvisioned_FallsBackToCloudOnly)
+{
+    // Simulate "no Vault" by clearing the cached rootnode handle. The Vault
+    // node still exists in the DB so the IN(?) bind can't accidentally match
+    // it as ancestor — but resolveListAllRoots must not push it.
+    mClient->mNodeManager.setRootNodeVault(NodeHandle());
+
+    auto got = allMatchesAsSet(MIME_TYPE_PHOTO,
+                               OrderByClause::DEFAULT_ASC,
+                               /*excludeSensitive=*/false);
+    EXPECT_GT(got.count(hClean), 0u) << "Cloud content must still be returned";
+    EXPECT_EQ(got.count(hVaultFile), 0u)
+        << "Vault content must not appear when rootnodes.vault is UNDEF";
+    EXPECT_EQ(got.count(hRubbishFile), 0u)
+        << "Rubbish remains excluded regardless of Vault provisioning";
+}
+
+// G1b. byLocationHandles (explicit ancestor) — Vault-only subset. Also covers
+//      narrowing semantics: default scope is Cloud+Vault, so seeing hClean
+//      excluded here proves explicitAncestors narrows to Vault only.
+TEST_F(ListAllNodesByPageTest, ExplicitAncestor_VaultHandle_OnlyVaultNodesReturned)
+{
+    const auto got = handlesOf(
+        mClient->mNodeManager.listAllNodesByPage(makeParams(MIME_TYPE_PHOTO,
+                                                            OrderByClause::DEFAULT_ASC,
+                                                            /*maxElements=*/0,
+                                                            /*excludeSensitive=*/false,
+                                                            /*cursor=*/std::nullopt,
+                                                            /*explicitAncestors=*/{hVault}),
+                                                 CancelToken{}));
+    EXPECT_EQ(got.count(hVaultFile), 1u) << "vault_file.jpg must be included under hVault";
+    EXPECT_EQ(got.count(hClean), 0u)
+        << "cloud-drive node must not be included — explicitAncestors must narrow "
+           "default Cloud+Vault scope to Vault only";
+    EXPECT_EQ(got.count(hRubbishFile), 0u) << "rubbish nodes must not leak";
+}
+
+// G1c. byLocationHandles (explicit ancestor) — Cloud-Drive root subset.
+TEST_F(ListAllNodesByPageTest, ExplicitAncestor_CloudHandle_OnlyCloudNodesReturned)
+{
+    const auto got = handlesOf(
+        mClient->mNodeManager.listAllNodesByPage(makeParams(MIME_TYPE_PHOTO,
+                                                            OrderByClause::DEFAULT_ASC,
+                                                            /*maxElements=*/0,
+                                                            /*excludeSensitive=*/false,
+                                                            /*cursor=*/std::nullopt,
+                                                            /*explicitAncestors=*/{hFilesRoot}),
+                                                 CancelToken{}));
+    EXPECT_EQ(got.count(hClean), 1u) << "clean.jpg under Cloud Drive must be included";
+    EXPECT_EQ(got.count(hVaultFile), 0u) << "vault_file.jpg must not leak";
+    EXPECT_EQ(got.count(hRubbishFile), 0u) << "rubbish_file.jpg must not leak";
+}
+
+// G1d. Sensitive filtering under default scope: a sensitive ancestor in the
+//      Cloud subtree hides its descendants; Vault content is unaffected unless
+//      separately flagged.
+TEST_F(ListAllNodesByPageTest, Sensitive_DefaultScope_CloudSensAncestor_StillFiltered)
+{
+    const auto got =
+        handlesOf(mClient->mNodeManager.listAllNodesByPage(makeParams(MIME_TYPE_PHOTO,
+                                                                      OrderByClause::DEFAULT_ASC,
+                                                                      /*maxElements=*/0,
+                                                                      /*excludeSensitive=*/true),
+                                                           CancelToken{}));
+    // Under a sensitive Cloud ancestor (hSensFolder): hUnderSens filtered out.
+    EXPECT_EQ(got.count(hUnderSens), 0u);
+    // Cloud node without sens ancestor: included.
+    EXPECT_EQ(got.count(hClean), 1u);
+    // Vault file: not under any sens ancestor, must still appear.
+    EXPECT_EQ(got.count(hVaultFile), 1u);
+}
+
+// G1e-h. DbTable-level tests for the dynamic IN(?,...) machinery. NodeManager
+//        exposes at most 2 real slots (Cloud + Vault under default scope); the
+//        tests below hit the DbTable virtual directly for full multi-root
+//        coverage.
+//
+// Contract pinned by G1e / G1e' / G1g:
+//   DbTable::listAllNodesByPage() rejects invalid root sets (empty, contains
+//   UNDEF, or size > kListAllMaxRoots) with `false` and leaves `out` empty. Empty
+//   `out` is the observable contract; `false` additionally pins the current
+//   layer behaviour so a silent switch to true+empty (also valid externally)
+//   is caught.
+//
+// G1f additionally pins the positive case: a valid root set (size in [1..
+// kListAllMaxRoots], no UNDEF) returns ok=true with the union of all reachable
+// subtrees — confirming the IN-list machinery emits every row any root reaches
+// (with file versions still excluded).
+//
+// G1h additionally pins that a duplicate handle in the IN-list does not produce
+// duplicate rows — a positive (ok=true) case validating structural dedup via
+// the EXISTS up-walk.
+
+// G1e. Empty filesRoots → rejected (guard path).
+TEST_F(ListAllNodesByPageTest, DbTable_EmptyRoots_ReturnsEmpty)
+{
+    assertDbTableRejectsRoots(/*roots=*/{}, "empty filesRoots");
+}
+
+// G1e'. Any UNDEF in filesRoots → rejected (caller contract).
+TEST_F(ListAllNodesByPageTest, DbTable_UndefInRoots_ReturnsEmpty)
+{
+    assertDbTableRejectsRoots({hFilesRoot, NodeHandle()}, "UNDEF in filesRoots");
+}
+
+// G1f. Three roots (Cloud + Vault + Rubbish) — result is the union of the
+//      three subtrees (file versions still excluded).
+TEST_F(ListAllNodesByPageTest, DbTable_ThreeRoots_UnionReturned)
+{
+    auto* table = dynamic_cast<DBTableNodes*>(mClient->sctable.get());
+    ASSERT_NE(table, nullptr);
+
+    std::vector<std::pair<NodeHandle, NodeSerialized>> out;
+    const std::vector<NodeHandle> roots{hFilesRoot, hVault, hRubbish};
+    const bool ok = table->listAllNodesByPage(
+        makeParams(MIME_TYPE_PHOTO, OrderByClause::DEFAULT_ASC, /*maxElements=*/0),
+        roots,
+        out,
+        CancelToken{});
+    ASSERT_TRUE(ok);
+
+    const auto got = handlesOf(out);
+    EXPECT_EQ(got.count(hVaultFile), 1u) << "vault subtree must be included";
+    EXPECT_EQ(got.count(hRubbishFile), 1u) << "rubbish subtree must be included";
+    EXPECT_GT(got.count(hClean), 0u) << "cloud subtree must be included";
+    // Versions still excluded regardless of root count.
+    EXPECT_EQ(got.count(hVersionV1), 0u);
+    EXPECT_EQ(got.count(hVersionV2), 0u);
+}
+
+// G1g. filesRoots.size() > kListAllMaxRoots(=3) → rejected. MEGA has 3 rootnodes
+//      structurally; sizes beyond that indicate a caller bug. Direct DbTable
+//      call because NodeManager::resolveListAllRoots tops out at 2.
+TEST_F(ListAllNodesByPageTest, DbTable_TooManyRoots_ReturnsEmpty)
+{
+    // 4 valid roots — exceeds kListAllMaxRoots=3.
+    assertDbTableRejectsRoots({hFilesRoot, hVault, hRubbish, hFilesRoot},
+                              "size > kListAllMaxRoots");
+}
+
+// G1h. Same handle passed twice — result deduped (not doubled).
+//      Dedup is structural: each row of `nodes` is matched at most once by the
+//      EXISTS up-walk regardless of how many times a root appears in the
+//      IN-list, so duplicates cannot arise — no GROUP BY required.
+TEST_F(ListAllNodesByPageTest, DbTable_DuplicateRootSlot_NoDuplicates)
+{
+    auto* table = dynamic_cast<DBTableNodes*>(mClient->sctable.get());
+    ASSERT_NE(table, nullptr);
+
+    std::vector<std::pair<NodeHandle, NodeSerialized>> out;
+    // Duplicate the Cloud root in two slots. Expected result count = same as
+    // single-Cloud.
+    const std::vector<NodeHandle> roots{hFilesRoot, hFilesRoot};
+    const bool ok = table->listAllNodesByPage(
+        makeParams(MIME_TYPE_PHOTO, OrderByClause::DEFAULT_ASC, /*maxElements=*/0),
+        roots,
+        out,
+        CancelToken{});
+    ASSERT_TRUE(ok);
+
+    const auto got = handlesOf(out);
+    EXPECT_EQ(got.size(), out.size()) << "duplicate root must not produce duplicate rows";
+    EXPECT_GT(out.size(), 0u) << "fixture invariant: cloud subtree must contain ≥ 1 photo";
+}
+
+// G2. Versions (FILENODE with FILENODE parent) are always excluded.
+TEST_F(ListAllNodesByPageTest, ExcludesFileVersions)
+{
+    // Sanity: confirm the version bit is set on the in-memory Node. If this
+    // fails, the problem is in Node construction / parent linkage, not the SQL.
+    auto v1 = mClient->mNodeManager.getNodeByHandle(hVersionV1);
+    ASSERT_NE(v1, nullptr);
+    ASSERT_NE(v1->parent, nullptr) << "version node must have its parent pointer set";
+    EXPECT_EQ(v1->parent->type, FILENODE)
+        << "version's parent must be a FILENODE so FLAGS_IS_VERSION is computed true";
+    EXPECT_TRUE(v1->getDBFlagsBitset().test(Node::FLAGS_IS_VERSION))
+        << "FLAGS_IS_VERSION should be set for a FILENODE child of a FILENODE";
+
+    for (bool exSens: {false, true})
+    {
+        SCOPED_TRACE(std::string("excludeSensitive=") + (exSens ? "true" : "false"));
+        auto got = allMatchesAsSet(MIME_TYPE_PHOTO, OrderByClause::DEFAULT_ASC, exSens);
+        EXPECT_EQ(got.count(hVersionV1), 0u) << "version_v1.jpg returned";
+        EXPECT_EQ(got.count(hVersionV2), 0u) << "version_v2.jpg returned";
+        EXPECT_EQ(got.count(hHead), 1u) << "HEAD must always be included";
+    }
+}
+
+// G3. excludeSensitive: node whose own SENS bit is set is excluded.
+TEST_F(ListAllNodesByPageTest, Sensitive_NodeDirectlyMarked)
+{
+    // self_sensitive.jpg: own SENS bit set.
+    EXPECT_EQ(allMatchesAsSet(MIME_TYPE_PHOTO,
+                              OrderByClause::DEFAULT_ASC,
+                              /*excludeSensitive=*/false)
+                  .count(hSelfSensitive),
+              1u);
+    EXPECT_EQ(allMatchesAsSet(MIME_TYPE_PHOTO,
+                              OrderByClause::DEFAULT_ASC,
+                              /*excludeSensitive=*/true)
+                  .count(hSelfSensitive),
+              0u);
+}
+
+// G4. excludeSensitive: node whose ancestor has SENS bit is excluded.
+TEST_F(ListAllNodesByPageTest, Sensitive_AncestorMarked)
+{
+    // under_sens.jpg: own flag is clean but sens_folder (parent) has SENS bit.
+    EXPECT_EQ(allMatchesAsSet(MIME_TYPE_PHOTO,
+                              OrderByClause::DEFAULT_ASC,
+                              /*excludeSensitive=*/false)
+                  .count(hUnderSens),
+              1u);
+    EXPECT_EQ(allMatchesAsSet(MIME_TYPE_PHOTO,
+                              OrderByClause::DEFAULT_ASC,
+                              /*excludeSensitive=*/true)
+                  .count(hUnderSens),
+              0u)
+        << "sensitive ancestor must propagate to descendant when filtering";
+}
+
+// G5. excludeSensitive: Cloud Drive root's own SENS bit is intentionally ignored.
+TEST_F(ListAllNodesByPageTest, Sensitive_FilesRootMarked_DescendantsStillReturned)
+{
+    // Mark the Cloud Drive root itself as sensitive. The up-walk CTE deliberately
+    // stops BEFORE inspecting filesRoot, so descendants must remain visible.
+    auto root = mClient->mNodeManager.getNodeByHandle(hFilesRoot);
+    ASSERT_NE(root, nullptr);
+    root->attrs.map[AttrMap::string2nameid("sen")] = "1";
+    mClient->mNodeManager.saveNodeInDb(root.get());
+
+    // Sanity: the attr-map poke + saveNodeInDb must land the SENS bit in the
+    // `flags` column the EXISTS walk reads. If this fails, the test below
+    // would pass for the wrong reason (no SENS anywhere, not root-ignored).
+    ASSERT_TRUE(root->getDBFlagsBitset().test(Node::FLAGS_IS_MARKED_SENSITIVE))
+        << "SENS bit did not propagate from attrs.map to flags after saveNodeInDb";
+
+    auto got = allMatchesAsSet(MIME_TYPE_PHOTO,
+                               OrderByClause::DEFAULT_ASC,
+                               /*excludeSensitive=*/true);
+    // clean.jpg and head.jpg are both strictly-non-sensitive and should still
+    // appear even though the root above them now carries the SENS bit.
+    EXPECT_EQ(got.count(hClean), 1u) << "clean.jpg should remain despite root SENS bit";
+    EXPECT_EQ(got.count(hHead), 1u) << "head.jpg should remain despite root SENS bit";
+}
+
+// G6. excludeSensitive: filtered set is a strict subset of the unfiltered set.
+TEST_F(ListAllNodesByPageTest, Sensitive_ResultIsSubsetWhenEnabled)
+{
+    auto all = allMatchesAsSet(MIME_TYPE_PHOTO,
+                               OrderByClause::DEFAULT_ASC,
+                               /*excludeSensitive=*/false);
+    auto filtered = allMatchesAsSet(MIME_TYPE_PHOTO,
+                                    OrderByClause::DEFAULT_ASC,
+                                    /*excludeSensitive=*/true);
+
+    // Strict subset: everything `filtered` returned must be in `all`, and the two
+    // sets must not be equal (our dataset contains at least one sensitive hit).
+    for (const auto& h: filtered)
+        EXPECT_EQ(all.count(h), 1u) << "filtered leaked a handle not in unfiltered set";
+    EXPECT_LT(filtered.size(), all.size())
+        << "dataset must contain at least one sensitive-excluded node";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -978,10 +1454,50 @@ protected:
     {
         return SearchByPageTest::collectAllByPage(order, pageSize, TEST_MIME);
     }
+
+    // Shared assertions for the H-group tiebreaker tests. All tests:
+    //   - paginate with pageSize=2 to split inside the tied group,
+    //   - check no duplicate handles,
+    //   - check the nodehandle tiebreaker advances strictly in the requested
+    //     direction, and
+    //   - check the full result equals the expected handle sequence
+    //     (mTiedHandles for ascending, reversed for descending).
+    void assertTiedHandleOrder(const std::vector<NodeHandle>& paged,
+                               bool ascending,
+                               const std::string& label) const
+    {
+        SCOPED_TRACE(label);
+        ASSERT_EQ(paged.size(), static_cast<size_t>(kNumTied));
+
+        const std::set<NodeHandle> unique(paged.begin(), paged.end());
+        ASSERT_EQ(unique.size(), paged.size())
+            << "duplicate handles in " << label << " tied result";
+
+        for (size_t i = 1; i < paged.size(); ++i)
+        {
+            if (ascending)
+            {
+                EXPECT_GT(paged[i].as8byte(), paged[i - 1].as8byte())
+                    << "nodehandle did not advance (ASC) in " << label << " tied sequence at index "
+                    << i;
+            }
+            else
+            {
+                EXPECT_LT(paged[i].as8byte(), paged[i - 1].as8byte())
+                    << "nodehandle did not decrease (DESC) in " << label
+                    << " tied sequence at index " << i;
+            }
+        }
+
+        const std::vector<NodeHandle> expected =
+            ascending ? mTiedHandles :
+                        std::vector<NodeHandle>(mTiedHandles.rbegin(), mTiedHandles.rend());
+        EXPECT_EQ(paged, expected) << label << " tied result does not match expected order";
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Group G – Nodehandle tiebreaker: split at page boundary inside a tied group
+//  Group H – Nodehandle tiebreaker: split at page boundary inside a tied group
 //
 //  Assertions for each test:
 //    1. No duplicate handles across the full result.
@@ -992,103 +1508,82 @@ protected:
 //    3. The full result equals the expected handle sequence.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// G1. LABEL_ASC with tied (isZero, label, name) – nodehandle ASC breaks the tie.
+// H1. LABEL_ASC with tied (isZero, label, name) – nodehandle ASC breaks the tie.
 //     Exercises buildCursorWhereForListAll (LABEL_ASC, sqlite.cpp:2686-2698):
 //       isZero = p1 AND label = p2 AND name = p3 AND nodehandle > p4
+//     LABEL_ASC reduces to nodehandle ASC → expected: mTiedHandles[0..4].
 TEST_F(TieBreakTest, LabelAsc_TiedLabelAndName_UsesNodehandleTieBreak)
 {
-    // All nodes share isZero=0, label=kTiedLabel, name="tied.txt".
-    // LABEL_ASC reduces to nodehandle ASC → expected: mTiedHandles[0..4].
-    const auto paged = collectAllByPage(OrderByClause::LABEL_ASC, 2);
-    ASSERT_EQ(paged.size(), static_cast<size_t>(kNumTied));
-
-    const std::set<NodeHandle> unique(paged.begin(), paged.end());
-    ASSERT_EQ(unique.size(), paged.size()) << "duplicate handles in LABEL_ASC tied result";
-
-    for (size_t i = 1; i < paged.size(); ++i)
-    {
-        EXPECT_GT(paged[i].as8byte(), paged[i - 1].as8byte())
-            << "nodehandle did not advance (ASC) in LABEL_ASC tied sequence at index " << i;
-    }
-
-    EXPECT_EQ(paged, mTiedHandles) << "LABEL_ASC tied result does not match handle-ascending order";
+    assertTiedHandleOrder(collectAllByPage(OrderByClause::LABEL_ASC, 2),
+                          /*ascending=*/true,
+                          "LABEL_ASC");
 }
 
-// G2. SIZE_DESC with tied (size, name) – nodehandle DESC breaks the tie.
+// H2. SIZE_DESC with tied (size, name) – nodehandle DESC breaks the tie.
 //     Exercises buildCursorWhereForListAll (SIZE_DESC, sqlite.cpp:2646-2652):
 //       sizeVirtual = p1 AND name = p2 AND nodehandle < p3
+//     SIZE_DESC: (size DESC, name DESC, nodehandle DESC) → reversed handles.
 TEST_F(TieBreakTest, SizeDesc_TiedSizeAndName_UsesNodehandleTieBreak)
 {
-    // All nodes share size=kTiedSize, name="tied.txt".
-    // SIZE_DESC: (size DESC, name DESC, nodehandle DESC) → expected: reversed handles.
-    const auto paged = collectAllByPage(OrderByClause::SIZE_DESC, 2);
-    ASSERT_EQ(paged.size(), static_cast<size_t>(kNumTied));
-
-    const std::set<NodeHandle> unique(paged.begin(), paged.end());
-    ASSERT_EQ(unique.size(), paged.size()) << "duplicate handles in SIZE_DESC tied result";
-
-    for (size_t i = 1; i < paged.size(); ++i)
-    {
-        EXPECT_LT(paged[i].as8byte(), paged[i - 1].as8byte())
-            << "nodehandle did not decrease (DESC) in SIZE_DESC tied sequence at index " << i;
-    }
-
-    const std::vector<NodeHandle> expected(mTiedHandles.rbegin(), mTiedHandles.rend());
-    EXPECT_EQ(paged, expected) << "SIZE_DESC tied result does not match handle-descending order";
+    assertTiedHandleOrder(collectAllByPage(OrderByClause::SIZE_DESC, 2),
+                          /*ascending=*/false,
+                          "SIZE_DESC");
 }
 
-// G3. MTIME_ASC with tied (mtime, name) – nodehandle ASC breaks the tie.
+// H3. MTIME_ASC with tied (mtime, name) – nodehandle ASC breaks the tie.
 //     Exercises buildCursorWhereForListAll (MTIME_ASC, sqlite.cpp:2654-2660):
 //       mtime = p1 AND name = p2 AND nodehandle > p3
+//     MTIME_ASC: (mtime ASC, name ASC, nodehandle ASC) → mTiedHandles[0..4].
 TEST_F(TieBreakTest, MtimeAsc_TiedMtimeAndName_UsesNodehandleTieBreak)
 {
-    // All nodes share mtime=kTiedMtime, name="tied.txt".
-    // MTIME_ASC: (mtime ASC, name ASC, nodehandle ASC) → expected: mTiedHandles[0..4].
-    const auto paged = collectAllByPage(OrderByClause::MTIME_ASC, 2);
-    ASSERT_EQ(paged.size(), static_cast<size_t>(kNumTied));
-
-    const std::set<NodeHandle> unique(paged.begin(), paged.end());
-    ASSERT_EQ(unique.size(), paged.size()) << "duplicate handles in MTIME_ASC tied result";
-
-    for (size_t i = 1; i < paged.size(); ++i)
-    {
-        EXPECT_GT(paged[i].as8byte(), paged[i - 1].as8byte())
-            << "nodehandle did not advance (ASC) in MTIME_ASC tied sequence at index " << i;
-    }
-
-    EXPECT_EQ(paged, mTiedHandles) << "MTIME_ASC tied result does not match handle-ascending order";
+    assertTiedHandleOrder(collectAllByPage(OrderByClause::MTIME_ASC, 2),
+                          /*ascending=*/true,
+                          "MTIME_ASC");
 }
 
-// G4. FAV_DESC with tied (fav, name) – nodehandle ASC breaks the tie.
+// H4. FAV_DESC with tied (fav, name) – nodehandle ASC breaks the tie.
 //     Exercises buildCursorWhereForListAll (FAV_DESC, sqlite.cpp:2678-2684):
 //       fav = p1 AND name = p2 AND nodehandle > p3
 //
-//     This is the "reverse" counterpart to G2 (SIZE_DESC): although both sort
+//     This is the "reverse" counterpart to H2 (SIZE_DESC): although both sort
 //     orders carry "DESC" in their name, their tiebreaker directions differ.
 //     SIZE_DESC uses  nodehandle < p3  (descending),
 //     FAV_DESC  uses  nodehandle > p3  (ascending, because fav/name are both ASC
-//     in the underlying ORDER BY clause).  A bug that swapped > / < for one
-//     of them would not be caught by the other test.
+//     in the underlying ORDER BY clause). A bug that swapped > / < for one of
+//     them would not be caught by the other test — that's why H4 stays separate
+//     from H2 even though both are "DESC" orderings.
 TEST_F(TieBreakTest, FavDesc_TiedFavAndName_UsesNodehandleAscTieBreak)
 {
-    // All nodes share fav=0 and name="tied.txt".
-    // FAV_DESC: ORDER BY fav ASC, name ASC, nodehandle ASC
-    //   → nodehandle tiebreaker is ASC (same direction as LABEL_ASC / MTIME_ASC,
-    //     opposite to SIZE_DESC which uses nodehandle DESC).
-    const auto paged = collectAllByPage(OrderByClause::FAV_DESC, 2);
-    ASSERT_EQ(paged.size(), static_cast<size_t>(kNumTied));
+    assertTiedHandleOrder(collectAllByPage(OrderByClause::FAV_DESC, 2),
+                          /*ascending=*/true,
+                          "FAV_DESC");
+}
 
-    const std::set<NodeHandle> unique(paged.begin(), paged.end());
-    ASSERT_EQ(unique.size(), paged.size()) << "duplicate handles in FAV_DESC tied result";
+// H5. DEFAULT_ASC with tied name – nodehandle ASC breaks the tie.
+//     Exercises buildCursorWhereForListAll (DEFAULT_ASC):
+//       (name > p1) OR (name = p1 AND nodehandle > p2)
+//     With every name == "tied.txt", reduces to pure nodehandle ASC.
+//     Distinct from H1/H3 because the DEFAULT cursor branch carries no
+//     leading sort-key field (no isZero/label/mtime/fav predicate term),
+//     so a regression in that branch is invisible to the other H tests.
+TEST_F(TieBreakTest, DefaultAsc_TiedName_UsesNodehandleTieBreak)
+{
+    assertTiedHandleOrder(collectAllByPage(OrderByClause::DEFAULT_ASC, 2),
+                          /*ascending=*/true,
+                          "DEFAULT_ASC");
+}
 
-    for (size_t i = 1; i < paged.size(); ++i)
-    {
-        EXPECT_GT(paged[i].as8byte(), paged[i - 1].as8byte())
-            << "nodehandle did not advance (ASC) in FAV_DESC tied sequence at index " << i
-            << " – check buildCursorWhereForListAll FAV_DESC uses nodehandle > p3, not <";
-    }
-
-    EXPECT_EQ(paged, mTiedHandles) << "FAV_DESC tied result does not match handle-ascending order";
+// H6. DEFAULT_DESC with tied name – nodehandle DESC breaks the tie.
+//     Exercises buildCursorWhereForListAll (DEFAULT_DESC):
+//       (name < p1) OR (name = p1 AND nodehandle < p2)
+//     A sign-flip in the DEFAULT_DESC branch (e.g. '>' instead of '<')
+//     would not be caught by H2 (SIZE_DESC) because the SIZE cursor uses
+//     a different SQL fragment with the sizeVirtual predicate term.
+TEST_F(TieBreakTest, DefaultDesc_TiedName_UsesNodehandleDescTieBreak)
+{
+    assertTiedHandleOrder(collectAllByPage(OrderByClause::DEFAULT_DESC, 2),
+                          /*ascending=*/false,
+                          "DEFAULT_DESC");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1110,6 +1605,28 @@ TEST_F(TieBreakTest, FavDesc_TiedFavAndName_UsesNodehandleAscTieBreak)
 class GroupedListAllNodesByPageTest: public SearchByPageTest
 {
 protected:
+    // Sensitive nodes used by grouped-path excludeSensitive TEST_Fs. A .mp4
+    // covers the VIDEO route of MIME_TYPE_ALL_VISUAL_MEDIA; a .pdf covers the
+    // PDF route of MIME_TYPE_ALL_DOCS. The base fixture already contributes a
+    // sensitive .jpg (self_sensitive.jpg) for the PHOTO route.
+    NodeHandle hVideoSensitive;
+    NodeHandle hReportSensitive;
+
+    // Dataset cardinality under the default Cloud+Vault scope (versions excluded,
+    // Rubbish excluded). Used by the ASSERT_EQ guard in C1/C2/D1 so a dataset
+    // tweak updates one place.
+    //
+    // PHOTO: Cloud subtree contributes {clean, self_sens, head, under_sens} = 4;
+    //        Vault subtree contributes {vault_file} = 1; total filter-subtree = 5.
+    //        VIDEO has no entries in the filter subtree.
+    static constexpr size_t kBaseFilterSubtreePhotos = 5;
+    static constexpr size_t kGroupedFixturePhotos = 3; // photo_alpha/beta/gamma
+    static constexpr size_t kGroupedFixtureVideos = 3; // video_alpha/beta/gamma
+    static constexpr size_t kGroupedSensitiveVideos = 1; // video_sensitive
+    static constexpr size_t kPhotoTotal = kGroupedFixturePhotos + kBaseFilterSubtreePhotos;
+    static constexpr size_t kVideoTotal = kGroupedFixtureVideos + kGroupedSensitiveVideos;
+    static constexpr size_t kVisualMediaTotal = kPhotoTotal + kVideoTotal;
+
     void SetUp() override
     {
         SearchByPageTest::SetUp();
@@ -1130,15 +1647,36 @@ protected:
         addNode(FILENODE, root, NodeMeta{"video_alpha.mp4", FILENODE, 900, baseMtime + 21, 0, 1});
         addNode(FILENODE, root, NodeMeta{"video_beta.mp4", FILENODE, 760, baseMtime + 22, 3, 0});
         addNode(FILENODE, root, NodeMeta{"video_gamma.mp4", FILENODE, 830, baseMtime + 23, 1, 1});
+
+        // Sensitive-flagged FILENODEs placed directly under the Cloud Drive root
+        // (not inside sens_folder) so that only the node's own SENS bit matters.
+        NodeMeta sensPdf{"report_sensitive.pdf", FILENODE, 300, baseMtime + 5, 0, 0};
+        sensPdf.sensitive = true;
+        hReportSensitive = addNode(FILENODE, root, sensPdf, /*isFetching=*/false)->nodeHandle();
+
+        NodeMeta sensVideo{"video_sensitive.mp4", FILENODE, 800, baseMtime + 24, 0, 0};
+        sensVideo.sensitive = true;
+        hVideoSensitive = addNode(FILENODE, root, sensVideo, /*isFetching=*/false)->nodeHandle();
     }
 
-    // Ground-truth via searchNodes() (single call, no cursor).
-    std::vector<NodeHandle> referenceBySearch(int order, MimeType_t mimeType) const
+    // Ground-truth via searchNodes() (single call, no cursor). When
+    // @p excludeSensitive is true, the filter switches NodeSearchFilter's
+    // bySensitivity to BoolFilter::onlyTrue, which the searchNodes SQL
+    // interprets as "exclude sensitive nodes" (see recent_actions.cpp:400,
+    // isValidSensitivity in nodemanager.cpp:102, and nodesCTE up-walk check
+    // at sqlite.cpp:2405 — the BoolFilter enum names are counter-intuitive:
+    // onlyTrue = drop sensitive rows, onlyFalse = keep only sensitive rows).
+    std::vector<NodeHandle> referenceBySearch(int order,
+                                              MimeType_t mimeType,
+                                              bool excludeSensitive = false) const
     {
         NodeSearchFilter filter;
-        filter.byAncestors({mRootHandle.as8byte(), UNDEF, UNDEF});
+        // Match listAllNodesByPage's default scope: Cloud + Vault.
+        filter.byAncestors({mRootHandle.as8byte(), hVault.as8byte(), UNDEF});
         filter.byNodeType(FILENODE);
         filter.byCategory(mimeType);
+        if (excludeSensitive)
+            filter.bySensitivity(NodeSearchFilter::BoolFilter::onlyTrue);
 
         auto nodes =
             mClient->mNodeManager.searchNodes(filter, order, CancelToken{}, NodeSearchPage{0, 0});
@@ -1149,33 +1687,55 @@ protected:
             result.push_back(n->nodeHandle());
         return result;
     }
+
+    // Sweep all 10 sort orders for @p mime, asserting the paginated walk equals
+    // the searchNodes reference and that the reference contains @p expectedCount
+    // entries (a fixture-cardinality guard — picks up dataset drift before the
+    // ordered comparison fires). Used by the C1/C2 / B1 sweep tests.
+    void assertAllOrdersPaginationMatchesSearch(MimeType_t mime,
+                                                size_t expectedCount,
+                                                const std::vector<OrderAndPageSize>& cases,
+                                                const std::string& mimeLabel)
+    {
+        for (const auto& [order, pageSize]: cases)
+        {
+            const auto reference = referenceBySearch(order, mime);
+            const auto paged = collectAllByPage(order, pageSize, mime);
+            ASSERT_EQ(reference.size(), expectedCount)
+                << "unexpected " << mimeLabel << " count for order=" << order;
+            assertListAllMatchesReference(paged,
+                                          reference,
+                                          mimeLabel + " order=" + std::to_string(order) +
+                                              " pageSize=" + std::to_string(pageSize));
+        }
+    }
+};
+
+// Default per-order page-size grid for the simple-path sweep tests
+// (C1: VIDEO, C2: PHOTO). Picked so DEFAULT/MTIME/FAV/LABEL each split the
+// 4-/8-node datasets at a non-divisible boundary.
+inline const std::vector<OrderAndPageSize> kSimplePathOrderCases = {
+    {OrderByClause::DEFAULT_ASC, 2},
+    {OrderByClause::DEFAULT_DESC, 3},
+    {OrderByClause::SIZE_ASC, 2},
+    {OrderByClause::SIZE_DESC, 3},
+    {OrderByClause::MTIME_ASC, 2},
+    {OrderByClause::MTIME_DESC, 3},
+    {OrderByClause::LABEL_ASC, 2},
+    {OrderByClause::LABEL_DESC, 3},
+    {OrderByClause::FAV_ASC, 2},
+    {OrderByClause::FAV_DESC, 3},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group A – MIME_TYPE_ALL_DOCS (grouped path: UNION ALL CTE over
 //            DOCUMENT + PDF + PRESENTATION + SPREADSHEET routes)
-//  Dataset: 20 .txt + 2 .pdf + 1 .pptx + 1 .xlsx = 24 nodes
+//  Dataset: 20 .txt + 3 .pdf (1 sensitive) + 1 .pptx + 1 .xlsx = 25 nodes
+//  (A1 uses excludeSensitive=false, so reference and paged both include
+//   report_sensitive.pdf. See Group E for the excludeSensitive=true path.)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// A1. Spot-check: DEFAULT_ASC pagination matches searchNodes reference.
-TEST_F(GroupedListAllNodesByPageTest, DefaultAsc_AllDocs_PaginationMatchesSearchReference)
-{
-    const auto reference = referenceBySearch(OrderByClause::DEFAULT_ASC, MIME_TYPE_ALL_DOCS);
-    const auto paged = collectAllByPage(OrderByClause::DEFAULT_ASC, 5, MIME_TYPE_ALL_DOCS);
-
-    assertListAllMatchesReference(paged, reference, "DEFAULT_ASC ALL_DOCS");
-}
-
-// A2. Spot-check: SIZE_DESC pagination matches searchNodes reference.
-TEST_F(GroupedListAllNodesByPageTest, SizeDesc_AllDocs_PaginationMatchesSearchReference)
-{
-    const auto reference = referenceBySearch(OrderByClause::SIZE_DESC, MIME_TYPE_ALL_DOCS);
-    const auto paged = collectAllByPage(OrderByClause::SIZE_DESC, 4, MIME_TYPE_ALL_DOCS);
-
-    assertListAllMatchesReference(paged, reference, "SIZE_DESC ALL_DOCS");
-}
-
-// A3. All 10 sort orders – paged result equals searchNodes reference for each.
+// A1. All 10 sort orders – paged result equals searchNodes reference for each.
 TEST_F(GroupedListAllNodesByPageTest, AllOrders_AllDocs_PaginationMatchesSearchReference)
 {
     const std::vector<OrderAndPageSize> cases = {
@@ -1205,7 +1765,10 @@ TEST_F(GroupedListAllNodesByPageTest, AllOrders_AllDocs_PaginationMatchesSearchR
 // ═══════════════════════════════════════════════════════════════════════════
 //  Group B – MIME_TYPE_ALL_VISUAL_MEDIA (grouped path: UNION ALL CTE over
 //            PHOTO + VIDEO routes)
-//  Dataset: 3 .jpg + 3 .mp4 = 6 nodes
+//  Dataset: 8 .jpg + 4 .mp4 = kVisualMediaTotal (12) Cloud+Vault-scope nodes
+//  (4 jpg from SearchByPageTest's Cloud filter subtree + 1 vault_file jpg +
+//   3 photo_* jpg + 3 video_* mp4 + 1 sensitive mp4. Versions of head.jpg and
+//   rubbish_file.jpg are excluded by the listAllNodesByPage filter chain.)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // B1. All 10 sort orders – paged result equals searchNodes reference for each.
@@ -1242,60 +1805,30 @@ TEST_F(GroupedListAllNodesByPageTest, AllOrders_AllVisualMedia_PaginationMatches
 //  constituent members inside the ALL_VISUAL_MEDIA grouped path.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// C1. MIME_TYPE_VIDEO individually – 3 .mp4 files, all 10 sort orders.
+// C1. MIME_TYPE_VIDEO individually – all 10 sort orders.
+//     Video count = 3 non-sensitive .mp4 (video_alpha/beta/gamma) + 1 sensitive
+//     .mp4 (video_sensitive, used by grouped excludeSensitive tests) = 4 nodes.
 TEST_F(GroupedListAllNodesByPageTest, AllOrders_Video_SimplePathPaginationMatchesSearchReference)
 {
-    const std::vector<OrderAndPageSize> cases = {
-        {OrderByClause::DEFAULT_ASC, 2},
-        {OrderByClause::DEFAULT_DESC, 3},
-        {OrderByClause::SIZE_ASC, 2},
-        {OrderByClause::SIZE_DESC, 3},
-        {OrderByClause::MTIME_ASC, 2},
-        {OrderByClause::MTIME_DESC, 3},
-        {OrderByClause::LABEL_ASC, 2},
-        {OrderByClause::LABEL_DESC, 3},
-        {OrderByClause::FAV_ASC, 2},
-        {OrderByClause::FAV_DESC, 3},
-    };
-
-    for (const auto& [order, pageSize]: cases)
-    {
-        const auto reference = referenceBySearch(order, MIME_TYPE_VIDEO);
-        const auto paged = collectAllByPage(order, pageSize, MIME_TYPE_VIDEO);
-        ASSERT_EQ(reference.size(), 3u) << "unexpected VIDEO count for order=" << order;
-        assertListAllMatchesReference(paged,
-                                      reference,
-                                      "VIDEO order=" + std::to_string(order) +
-                                          " pageSize=" + std::to_string(pageSize));
-    }
+    assertAllOrdersPaginationMatchesSearch(MIME_TYPE_VIDEO,
+                                           kVideoTotal,
+                                           kSimplePathOrderCases,
+                                           "VIDEO");
 }
 
-// C2. MIME_TYPE_PHOTO individually – 3 .jpg files, all 10 sort orders.
+// C2. MIME_TYPE_PHOTO individually – all 10 sort orders.
+//     Photo count under the default Cloud+Vault scope =
+//         3 photo_*.jpg (this fixture) + 4 jpg from SearchByPageTest's Cloud
+//         subtree (clean, self_sensitive, head, under_sens) + 1 jpg in Vault
+//         (vault_file) = 8 nodes.
+//     Versions of head.jpg are always excluded; rubbish_file is filtered out
+//     because Rubbish is not part of the default scope.
 TEST_F(GroupedListAllNodesByPageTest, AllOrders_Photo_SimplePathPaginationMatchesSearchReference)
 {
-    const std::vector<OrderAndPageSize> cases = {
-        {OrderByClause::DEFAULT_ASC, 2},
-        {OrderByClause::DEFAULT_DESC, 3},
-        {OrderByClause::SIZE_ASC, 2},
-        {OrderByClause::SIZE_DESC, 3},
-        {OrderByClause::MTIME_ASC, 2},
-        {OrderByClause::MTIME_DESC, 3},
-        {OrderByClause::LABEL_ASC, 2},
-        {OrderByClause::LABEL_DESC, 3},
-        {OrderByClause::FAV_ASC, 2},
-        {OrderByClause::FAV_DESC, 3},
-    };
-
-    for (const auto& [order, pageSize]: cases)
-    {
-        const auto reference = referenceBySearch(order, MIME_TYPE_PHOTO);
-        const auto paged = collectAllByPage(order, pageSize, MIME_TYPE_PHOTO);
-        ASSERT_EQ(reference.size(), 3u) << "unexpected PHOTO count for order=" << order;
-        assertListAllMatchesReference(paged,
-                                      reference,
-                                      "PHOTO order=" + std::to_string(order) +
-                                          " pageSize=" + std::to_string(pageSize));
-    }
+    assertAllOrdersPaginationMatchesSearch(MIME_TYPE_PHOTO,
+                                           kPhotoTotal,
+                                           kSimplePathOrderCases,
+                                           "PHOTO");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1308,11 +1841,11 @@ TEST_F(GroupedListAllNodesByPageTest, AllOrders_Photo_SimplePathPaginationMatche
 //     PHOTO + VIDEO, sqlite.cpp:2878).  A delete between pages must not cause
 //     cursor-based pagination to skip any remaining visual-media nodes.
 //
-//     Dataset: 3 .jpg + 3 .mp4 = 6 nodes. DEFAULT_DESC orders them by name DESC:
-//       video_gamma.mp4, video_beta.mp4, video_alpha.mp4,
-//       photo_gamma.jpg, photo_beta.jpg, photo_alpha.jpg
-//     Page 1 (size=3) = first three. Deleted = photo_gamma.jpg (4th in ordering).
-//     Expected in page 2+: photo_beta.jpg, photo_alpha.jpg.
+//     Dataset under default Cloud+Vault scope: 8 .jpg (3 photo_* + 4 from the
+//     Cloud filter subtree + 1 vault_file) + 3 non-sensitive .mp4 + 1 sensitive
+//     .mp4 = 12 visual-media nodes. excludeSensitive=false keeps them all.
+//     pageSize=3, delete the node at reference[3] (first of page 2), then
+//     verify no remaining node is skipped and page-1 entries aren't repeated.
 TEST_F(GroupedListAllNodesByPageTest, AllVisualMedia_DefaultDesc_DeletionBetweenPages_NoSkip)
 {
     constexpr MimeType_t mime = MIME_TYPE_ALL_VISUAL_MEDIA;
@@ -1320,13 +1853,10 @@ TEST_F(GroupedListAllNodesByPageTest, AllVisualMedia_DefaultDesc_DeletionBetween
     constexpr size_t pageSize = 3;
 
     const auto fullReference = referenceBySearch(order, mime);
-    ASSERT_EQ(fullReference.size(), 6u);
+    ASSERT_EQ(fullReference.size(), kVisualMediaTotal);
 
-    auto page1 = mClient->mNodeManager.listAllNodesByPage(mime,
-                                                          order,
-                                                          CancelToken{},
-                                                          pageSize,
-                                                          std::nullopt);
+    auto page1 =
+        mClient->mNodeManager.listAllNodesByPage(makeParams(mime, order, pageSize), CancelToken{});
     ASSERT_EQ(page1.size(), pageSize);
 
     // Delete the first node of what would be page 2 in offset terms.
@@ -1353,6 +1883,470 @@ TEST_F(GroupedListAllNodesByPageTest, AllVisualMedia_DefaultDesc_DeletionBetween
     {
         EXPECT_EQ(page2Set.count(n->nodeHandle()), 0u) << "page-1 handle repeated in page 2+";
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Group E – excludeSensitive=true on grouped routes (UNION ALL CTE)
+//
+//  The simple-path Sensitive_* TEST_Fs (fixture ListAllNodesByPageTest) only
+//  exercise one route (PHOTO). buildGroupedListAllQuery stitches the
+//  buildUpWalkExists predicate into every constituent SELECT, so a bug in a
+//  single route's parameter binding would pass the PHOTO-only coverage. The
+//  tests below push the sensitive predicate through both PHOTO+VIDEO routes
+//  of ALL_VISUAL_MEDIA and through the PDF route of ALL_DOCS.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// E1. ALL_VISUAL_MEDIA with excludeSensitive=true must drop the sensitive photo
+//     AND the sensitive video — one per UNION route — while keeping every
+//     non-sensitive entry.
+TEST_F(GroupedListAllNodesByPageTest, AllVisualMedia_ExcludeSensitive_FiltersBothPhotoAndVideo)
+{
+    const auto all = allMatchesAsSet(MIME_TYPE_ALL_VISUAL_MEDIA,
+                                     OrderByClause::DEFAULT_ASC,
+                                     /*excludeSensitive=*/false);
+    const auto filtered = allMatchesAsSet(MIME_TYPE_ALL_VISUAL_MEDIA,
+                                          OrderByClause::DEFAULT_ASC,
+                                          /*excludeSensitive=*/true);
+
+    // Photo route: self_sensitive.jpg + under_sens.jpg (ancestor) removed.
+    EXPECT_EQ(filtered.count(hSelfSensitive), 0u) << "self_sensitive.jpg leaked";
+    EXPECT_EQ(filtered.count(hUnderSens), 0u) << "under_sens.jpg leaked";
+    // Video route: video_sensitive.mp4 removed by the grouped EXISTS predicate.
+    EXPECT_EQ(filtered.count(hVideoSensitive), 0u)
+        << "video_sensitive.mp4 leaked — grouped path may be missing the "
+           "sensitivity EXISTS on the VIDEO route";
+
+    // Strict subset with a strictly smaller size: dataset carries ≥ 3 sensitive-
+    // excluded entries, so filtered.size() must be less than all.size().
+    for (const auto& h: filtered)
+        EXPECT_EQ(all.count(h), 1u) << "filtered leaked a handle not in unfiltered set";
+    EXPECT_LT(filtered.size(), all.size())
+        << "ALL_VISUAL_MEDIA excludeSensitive=true did not remove any node";
+}
+
+// E2. Paginated ALL_VISUAL_MEDIA + excludeSensitive=true must equal the
+//     searchNodes reference that applies bySensitivity(onlyTrue) — onlyTrue
+//     drops sensitive rows in the search filter (counter-intuitive name; see
+//     referenceBySearch comment). Cross-checks that the grouped UNION-ALL path
+//     produces the same ordered sequence as the canonical searchNodes walker
+//     when sensitivity filtering is on.
+TEST_F(GroupedListAllNodesByPageTest, AllVisualMedia_ExcludeSensitive_MatchesSearchReference)
+{
+    constexpr MimeType_t mime = MIME_TYPE_ALL_VISUAL_MEDIA;
+    const std::vector<OrderAndPageSize> cases = {
+        {OrderByClause::DEFAULT_ASC, 3},
+        {OrderByClause::SIZE_DESC, 4},
+        {OrderByClause::MTIME_ASC, 2},
+    };
+
+    for (const auto& [order, pageSize]: cases)
+    {
+        const auto reference = referenceBySearch(order, mime, /*excludeSensitive=*/true);
+        const auto paged = collectAllByPage(order,
+                                            pageSize,
+                                            mime,
+                                            /*startCursor=*/std::nullopt,
+                                            /*excludeSensitive=*/true);
+        assertListAllMatchesReference(paged,
+                                      reference,
+                                      "ALL_VISUAL_MEDIA excludeSensitive order=" +
+                                          std::to_string(order));
+    }
+}
+
+// E3. ALL_DOCS with excludeSensitive=true must drop a sensitive document
+//     (report_sensitive.pdf) while keeping every non-sensitive .txt/.pdf/.pptx/
+//     .xlsx. Guards against a PDF-route regression where the EXISTS bind
+//     slot drifted relative to the DOCUMENT / PRESENTATION / SPREADSHEET routes.
+TEST_F(GroupedListAllNodesByPageTest, AllDocs_ExcludeSensitive_FiltersCorrectly)
+{
+    const auto all = allMatchesAsSet(MIME_TYPE_ALL_DOCS,
+                                     OrderByClause::DEFAULT_ASC,
+                                     /*excludeSensitive=*/false);
+    const auto filtered = allMatchesAsSet(MIME_TYPE_ALL_DOCS,
+                                          OrderByClause::DEFAULT_ASC,
+                                          /*excludeSensitive=*/true);
+
+    EXPECT_EQ(all.count(hReportSensitive), 1u)
+        << "precondition: ALL_DOCS with excludeSensitive=false must surface "
+           "report_sensitive.pdf";
+    EXPECT_EQ(filtered.count(hReportSensitive), 0u)
+        << "report_sensitive.pdf leaked through the ALL_DOCS PDF route";
+
+    for (const auto& h: filtered)
+        EXPECT_EQ(all.count(h), 1u) << "filtered leaked a handle not in unfiltered set";
+    EXPECT_EQ(all.size(), filtered.size() + 1u)
+        << "ALL_DOCS excludeSensitive=true must remove exactly the sensitive .pdf";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Group H — byExcludeLocationHandles (excSeen accumulator, semantic A)
+//
+//  Reuses the SearchByPageTest fixture (Cloud + Vault + Rubbish photo subtree
+//  built by populateDB). The exclude-list is implemented as a recursive
+//  excSeen bit walked alongside sensSeen + a final-row `up.h NOT IN excludes`
+//  check; the cases below pin both pieces against a single concrete tree.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// H1. Exclude an interior folder: every descendant (direct and grand-) must be
+//     dropped. Sibling files outside the excluded folder must remain.
+TEST_F(ListAllNodesByPageTest, ByExclude_InteriorFolder_DropsWholeSubtree)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hNormalFolder});
+
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hClean), 0u) << "clean.jpg is a direct child of the excluded folder";
+    EXPECT_EQ(got.count(hHead), 0u) << "head.jpg dropped via excluded ancestor";
+    EXPECT_EQ(got.count(hSelfSensitive), 0u) << "self_sensitive.jpg dropped via excluded ancestor";
+    // Vault content survives — exclude list is independent of include scope.
+    EXPECT_EQ(got.count(hVaultFile), 1u);
+}
+
+// H2. Exclude the node itself (not a folder): the initial-row excSeen check
+//     `(n.nodehandle IN excludes)` must drop the node directly.
+TEST_F(ListAllNodesByPageTest, ByExclude_NodeItself_DroppedByInitialCheck)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hClean});
+
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hClean), 0u) << "n itself in excludes — must be dropped";
+    // Other photos under the same folder must remain.
+    EXPECT_EQ(got.count(hHead), 1u);
+    EXPECT_EQ(got.count(hVaultFile), 1u);
+}
+
+// H3. Semantic A: excluding a root drops its entire subtree even when that
+//     root is also the only included ancestor. Combination of byLocationHandles
+//     and byExcludeLocationHandles with a deliberate handle overlap.
+TEST_F(ListAllNodesByPageTest, ByExclude_MatchedRoot_SemanticA_DropsSubtree)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{hVault},
+                        /*excludeHandles=*/{hVault});
+
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_TRUE(got.empty())
+        << "Excluding the only included root must drop the whole subtree (semantic A); "
+           "got "
+        << got.size() << " nodes";
+}
+
+// H4. Default scope (Cloud + Vault) with exclude={hVault} drops Vault content
+//     but keeps Cloud — the user-visible answer to "exclude My Backups
+//     folder". Independence from include path is the point.
+TEST_F(ListAllNodesByPageTest, ByExclude_DefaultScope_VaultExcluded_KeepsCloud)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hVault});
+
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hVaultFile), 0u) << "Vault subtree must be dropped — root in exclude list";
+    EXPECT_EQ(got.count(hClean), 1u) << "Cloud content unaffected by Vault exclusion";
+    EXPECT_EQ(got.count(hRubbishFile), 0u)
+        << "Rubbish still excluded by default scope (independent of exclude list)";
+}
+
+// H5. Empty exclude list is equivalent to the pre-Phase-2 baseline. Pins the
+//     "no-exclude template branch" parity — buildUpWalkExists must not emit
+//     the excSeen column / IN-list when numExcludes == 0.
+TEST_F(ListAllNodesByPageTest, ByExclude_EmptyList_EquivalentToBaseline)
+{
+    const auto baseline = allMatchesAsSet(MIME_TYPE_PHOTO,
+                                          OrderByClause::DEFAULT_ASC,
+                                          /*excludeSensitive=*/false);
+
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{});
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got, baseline)
+        << "Empty exclude list must produce a result identical to the no-filter baseline";
+}
+
+// H6. Multiple exclude handles (up to kListAllMaxExcludes=3): chain accumulates
+//     OR over all entries. Excluding both Cloud and Vault folders simultaneously
+//     leaves Rubbish-only — pinned via locationScope=
+//     LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH.
+TEST_F(ListAllNodesByPageTest, ByExclude_MultipleHandles_OrAccumulated)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hFilesRoot, hVault},
+                        /*locationScope=*/2 /* CLOUD+VAULT+RUBBISH */);
+
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hClean), 0u);
+    EXPECT_EQ(got.count(hVaultFile), 0u);
+    EXPECT_EQ(got.count(hRubbishFile), 1u)
+        << "Rubbish must remain — neither Cloud nor Vault root excludes it";
+}
+
+// H7. DbTable-level rejection: oversize exclude list (> kListAllMaxExcludes=3)
+//     short-circuits with ok=false and empty out — same contract as filesRoots.
+TEST_F(ListAllNodesByPageTest, DbTable_TooManyExcludes_ReturnsEmpty)
+{
+    auto* table = dynamic_cast<DBTableNodes*>(mClient->sctable.get());
+    ASSERT_NE(table, nullptr);
+
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hClean, hHead, hVault, hRubbish}); // 4 entries
+
+    std::vector<std::pair<NodeHandle, NodeSerialized>> out;
+    const bool ok = table->listAllNodesByPage(p,
+                                              /*roots=*/{hFilesRoot},
+                                              out,
+                                              CancelToken{});
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(out.empty());
+}
+
+// H8. DbTable-level rejection: UNDEF in exclude list short-circuits.
+TEST_F(ListAllNodesByPageTest, DbTable_UndefInExcludes_ReturnsEmpty)
+{
+    auto* table = dynamic_cast<DBTableNodes*>(mClient->sctable.get());
+    ASSERT_NE(table, nullptr);
+
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hClean, NodeHandle()});
+
+    std::vector<std::pair<NodeHandle, NodeSerialized>> out;
+    const bool ok = table->listAllNodesByPage(p,
+                                              /*roots=*/{hFilesRoot},
+                                              out,
+                                              CancelToken{});
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(out.empty());
+}
+
+// H9. Pagination across an exclude boundary. Drop hSelfSensitive via exclude;
+//     two pages of size 2 must produce no skips/duplicates.
+TEST_F(ListAllNodesByPageTest, ByExclude_CursorAcrossExcludeBoundary_NoSkipsNoDuplicates)
+{
+    // Reference: single full-set call without exclude, then strip hSelfSensitive
+    // — same expected output as the paged exclude run.
+    std::vector<NodeHandle> reference;
+    {
+        auto refParams = makeParams(MIME_TYPE_PHOTO,
+                                    OrderByClause::DEFAULT_ASC,
+                                    /*maxElements=*/0,
+                                    /*excludeSensitive=*/false);
+        auto refNodes = mClient->mNodeManager.listAllNodesByPage(refParams, CancelToken{});
+        for (const auto& n: refNodes)
+            if (n->nodeHandle() != hSelfSensitive)
+                reference.push_back(n->nodeHandle());
+    }
+
+    // Now collect the same set page-by-page with pageSize=2 + exclude.
+    std::vector<NodeHandle> paged;
+    std::optional<NodeSearchCursorOffset> cursor;
+    const size_t maxIters = mMeta.size() + 2;
+    size_t i = 0;
+    for (; i < maxIters; ++i)
+    {
+        auto p = makeParams(MIME_TYPE_PHOTO,
+                            OrderByClause::DEFAULT_ASC,
+                            /*maxElements=*/2,
+                            /*excludeSensitive=*/false,
+                            cursor,
+                            /*explicitAncestors=*/{},
+                            /*excludeHandles=*/{hSelfSensitive});
+        auto nodes = mClient->mNodeManager.listAllNodesByPage(p, CancelToken{});
+        if (nodes.empty())
+            break;
+        for (const auto& n: nodes)
+            paged.push_back(n->nodeHandle());
+        const auto* lastNode = nodes.back().get();
+        NodeSearchCursorOffset c;
+        c.mLastName = lastNode->displayname() ? lastNode->displayname() : "";
+        c.mLastHandle = lastNode->nodeHandle().as8byte();
+        cursor = c;
+    }
+
+    ASSERT_LT(i, maxIters) << "Pagination did not terminate within " << maxIters
+                           << " iterations — likely an infinite-pagination regression";
+
+    // Order-preserving equivalence to reference.
+    EXPECT_EQ(paged, reference)
+        << "Pagination across an excluded row must skip it without losing or duplicating others";
+}
+
+// H10. Cache-key separation: same (mimeType, order, hasCursor, excludeSensitive,
+//      numRoots) but different numExcludes must produce different prepared
+//      statements. Verifies computeListAllCacheId(numExcludes) is wired in.
+//      We assert it indirectly: a back-to-back call sequence with then without
+//      excludes must succeed (not crash from a stale-stmt parameter mismatch).
+TEST_F(ListAllNodesByPageTest, ByExclude_CacheKey_DistinctAcross_NumExcludes)
+{
+    auto p_with = makeParams(MIME_TYPE_PHOTO,
+                             OrderByClause::DEFAULT_ASC,
+                             /*maxElements=*/0,
+                             /*excludeSensitive=*/false,
+                             /*cursor=*/std::nullopt,
+                             /*explicitAncestors=*/{},
+                             /*excludeHandles=*/{hVault});
+    auto p_without = makeParams(MIME_TYPE_PHOTO,
+                                OrderByClause::DEFAULT_ASC,
+                                /*maxElements=*/0,
+                                /*excludeSensitive=*/false,
+                                /*cursor=*/std::nullopt,
+                                /*explicitAncestors=*/{},
+                                /*excludeHandles=*/{});
+
+    const auto a = handlesOf(mClient->mNodeManager.listAllNodesByPage(p_with, CancelToken{}));
+    const auto b = handlesOf(mClient->mNodeManager.listAllNodesByPage(p_without, CancelToken{}));
+    const auto a2 = handlesOf(mClient->mNodeManager.listAllNodesByPage(p_with, CancelToken{}));
+    const auto b2 = handlesOf(mClient->mNodeManager.listAllNodesByPage(p_without, CancelToken{}));
+    EXPECT_EQ(a, a2) << "Same params with excludes must be deterministic across repeated calls";
+    EXPECT_EQ(b, b2) << "Same params without excludes must be deterministic across repeated calls";
+    EXPECT_NE(a, b) << "Differently-shaped statements must not share a prepared stmt cache slot";
+    EXPECT_LT(a.size(), b.size())
+        << "exclude={vault} must drop at least the vault subtree compared to no exclude";
+}
+
+// H11. excludeHandles and excludeSensitive walk independent accumulator bits
+//      (excSeen vs sensSeen) in buildUpWalkExists. Pin orthogonality so a
+//      future refactor that merges or reorders them gets caught.
+//
+//      With the fixture's normal_folder subtree:
+//        - hClean / hSelfSensitive / hHead under hNormalFolder.
+//        - hSelfSensitive carries its own SENS bit; hUnderSens inherits SENS
+//          via hSensFolder; hVaultFile is unaffected by either filter.
+//      Expected drops with both filters enabled simultaneously:
+//        - hClean       → dropped by exclude=normal_folder (clean's ancestor)
+//        - hSelfSensitive → dropped by both
+//        - hHead        → dropped by exclude (also under normal_folder)
+//        - hUnderSens   → dropped by sensSeen (sens_folder ancestor)
+//      Surviving: hVaultFile.
+TEST_F(ListAllNodesByPageTest, ByExclude_AndExcludeSensitive_AreOrthogonal)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/true,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{hNormalFolder});
+
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hClean), 0u) << "dropped by excludeHandles";
+    EXPECT_EQ(got.count(hHead), 0u) << "dropped by excludeHandles";
+    EXPECT_EQ(got.count(hSelfSensitive), 0u) << "dropped by both filters";
+    EXPECT_EQ(got.count(hUnderSens), 0u) << "dropped by excludeSensitive";
+    EXPECT_EQ(got.count(hVaultFile), 1u) << "unaffected by either filter";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Group I — locationScope (LOCATION_*)
+//
+//  Verifies that resolveListAllRoots maps each enum value to the right
+//  rootnode set. SQL plumbing reuses the existing numRoots IN-list machinery
+//  (already covered by G1*); these tests pin the NodeManager layer.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// I1. LOCATION_CLOUD_DRIVE: only Cloud rootnode is walked; Vault and Rubbish
+//     subtree photos must be absent.
+TEST_F(ListAllNodesByPageTest, LocationScope_CloudDriveOnly_ExcludesVaultAndRubbish)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{},
+                        /*locationScope=*/0 /* LOCATION_CLOUD_DRIVE */);
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hClean), 1u);
+    EXPECT_EQ(got.count(hVaultFile), 0u);
+    EXPECT_EQ(got.count(hRubbishFile), 0u);
+}
+
+// I2. LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH: all three rootnodes walked.
+TEST_F(ListAllNodesByPageTest, LocationScope_AllRootnodes_IncludesRubbish)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{},
+                        /*excludeHandles=*/{},
+                        /*locationScope=*/2 /* CLOUD+VAULT+RUBBISH */);
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    EXPECT_EQ(got.count(hClean), 1u);
+    EXPECT_EQ(got.count(hVaultFile), 1u);
+    EXPECT_EQ(got.count(hRubbishFile), 1u)
+        << "Rubbish subtree photos must surface when locationScope == ALL";
+}
+
+// I3. explicitAncestors wins over locationScope: when both are set, the list
+//     takes precedence and locationScope is silently ignored. Pinned by
+//     setting explicitAncestors={Vault} with locationScope=CLOUD_DRIVE_ONLY:
+//     the Cloud-only scope must NOT narrow further.
+TEST_F(ListAllNodesByPageTest, LocationScope_IgnoredWhenExplicitAncestorsPresent)
+{
+    auto p = makeParams(MIME_TYPE_PHOTO,
+                        OrderByClause::DEFAULT_ASC,
+                        /*maxElements=*/0,
+                        /*excludeSensitive=*/false,
+                        /*cursor=*/std::nullopt,
+                        /*explicitAncestors=*/{hVault},
+                        /*excludeHandles=*/{},
+                        /*locationScope=*/0 /* LOCATION_CLOUD_DRIVE */);
+    const auto got = handlesOf(mClient->mNodeManager.listAllNodesByPage(p, CancelToken{}));
+
+    // Vault content must appear despite locationScope saying "Cloud only".
+    EXPECT_EQ(got.count(hVaultFile), 1u);
+    // Cloud content must NOT appear because explicitAncestors didn't include it.
+    EXPECT_EQ(got.count(hClean), 0u);
 }
 
 } // anonymous namespace

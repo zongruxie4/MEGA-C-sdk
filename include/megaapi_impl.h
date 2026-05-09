@@ -3640,6 +3640,48 @@ private:
     static int validateBoolFilterOption(const int value);
 };
 
+class MegaListAllNodesFilterPrivate: public MegaListAllNodesFilter
+{
+public:
+    MegaListAllNodesFilterPrivate* copy() const override
+    {
+        return new MegaListAllNodesFilterPrivate(*this);
+    }
+
+    void byCategory(int mimeType) override;
+    void byLocationHandles(const MegaHandleList* ancestorHandles) override;
+    void byExcludeLocationHandles(const MegaHandleList* excludeHandles) override;
+    void byLocation(int scope) override;
+    void bySensitivity(int filterOption) override;
+
+    int byCategory() const override
+    {
+        return mCategory;
+    }
+
+    MegaHandleList* byLocationHandles() const override;
+    MegaHandleList* byExcludeLocationHandles() const override;
+
+    int byLocation() const override
+    {
+        return mLocation;
+    }
+
+    int bySensitivity() const override
+    {
+        return mSensitivity;
+    }
+
+private:
+    static void copyMegaHandleListInto(const MegaHandleList* src, std::vector<MegaHandle>& dst);
+
+    int mCategory = MegaApi::FILE_TYPE_DEFAULT;
+    std::vector<MegaHandle> mLocationHandles; // empty == use mLocation scope
+    std::vector<MegaHandle> mExcludeLocationHandles; // empty == disabled
+    int mLocation = MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT;
+    int mSensitivity = MegaListAllNodesFilter::SENSITIVITY_SHOW_ALL;
+};
+
 class MegaSearchPagePrivate : public MegaSearchPage
 {
 public:
@@ -4500,7 +4542,7 @@ public:
 
         MegaNodeList* search(const MegaSearchFilter* filter, int order, CancelToken cancelToken, const MegaSearchPage* searchPage);
 
-        MegaNodeList* listAllNodesByPage(int mimeType,
+        MegaNodeList* listAllNodesByPage(const MegaListAllNodesFilter* filter,
                                          int order,
                                          CancelToken cancelToken,
                                          size_t maxElements,
@@ -4511,6 +4553,17 @@ public:
                                               int order,
                                               CancelToken cancelToken,
                                               const MegaSearchPage* searchPage);
+
+        // Validates + converts public MegaListAllNodesFilter / cursor inputs into
+        // an internal ListAllNodesParams. Returns std::nullopt (and logs a warning)
+        // when byCategory is FILE_TYPE_DEFAULT, the order is unsupported, or the
+        // cursor is missing a required sort-key field. Unsupported filter fields
+        // do not exist on MegaListAllNodesFilter, so there is no reject list here.
+        std::optional<ListAllNodesParams>
+            buildListAllParams(const MegaListAllNodesFilter* filter,
+                               int order,
+                               size_t maxElements,
+                               const MegaSearchCursorOffset* cursor) const;
 
     public:
         bool processMegaTree(MegaNode* node, MegaTreeProcessor* processor, bool recursive = 1);
