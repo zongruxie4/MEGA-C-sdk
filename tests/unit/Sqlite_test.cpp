@@ -4,14 +4,18 @@
  *        listAllNodesByPage() cursor-based (keyset) pagination.
  */
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <mega/db/sqlite.h>
 #include <mega/localpath.h>
 
 #include <filesystem>
 #include <mega.h>
+#include <set>
+#include <sqlite3.h>
 #include <stdfs.h>
 #include <string>
+#include <vector>
 
 using namespace mega;
 
@@ -102,6 +106,159 @@ TEST(Sqlite, renameDB)
             << "File " << aux << "doesn't exit when it should";
     }
 }
+
+#ifdef USE_SQLITE
+
+/**
+ * @brief Validate that opening a DB shaped like a previous schema version
+ *        runs the column-migration path to completion.
+ *
+ * Regression guard for DB-migration bugs where a new VIRTUAL column
+ * references a base column that does not exist in older on-disk schemas,
+ * e.g. "ADD COLUMN fingerprintVirtual32 BLOB AS (getFingerprintExcludingMtime(fp)) VIRTUAL"
+ * failing with "no such column: fp" on upgraded databases.
+ *
+ * Steps:
+ *  - Seed an on-disk DB with an older `nodes` schema (base columns only).
+ *  - Open via SqliteDbAccess::openTableWithNodes, which runs addAndPopulateColumns.
+ *  - Assert the call succeeds and every expected column is present afterwards.
+ */
+TEST(Sqlite, MigratesOldNodesSchema)
+{
+    auto dirPath = std::filesystem::current_path() / "nodes_schema_migration_test";
+
+    const MrProper cleanUp(
+        [dirPath]()
+        {
+            std::filesystem::remove_all(dirPath);
+        });
+
+    std::filesystem::remove_all(dirPath);
+    std::filesystem::create_directory(dirPath);
+    LocalPath folderPath = LocalPath::fromAbsolutePath(path_u8string(dirPath));
+    SqliteDbAccess dbAccess{folderPath};
+
+    std::unique_ptr<FileSystemAccess> fsaccess{new FSACCESS_CLASS};
+    const std::string dbName{"nodes_schema_migration"};
+    LocalPath dbLocalPath = dbAccess.databasePath(*fsaccess, dbName, DbAccess::DB_VERSION);
+    const std::string dbPathStr = dbLocalPath.toPath(false);
+
+    // sqlite3_open may allocate the handle even on error, and the handle
+    // must be released via sqlite3_close regardless. Wrap in unique_ptr so
+    // close runs on every exit path (including ASSERT_* aborts).
+    using SqliteHandle = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
+
+    auto openSqlite = [](const std::string& path) -> std::pair<SqliteHandle, int>
+    {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open(path.c_str(), &raw);
+        return {SqliteHandle{raw, &sqlite3_close}, rc};
+    };
+
+    {
+        auto [dbGuard, openRc] = openSqlite(dbPathStr);
+        ASSERT_EQ(SQLITE_OK, openRc);
+
+        // NOTE: Keep this schema frozen — do not add or remove columns here.
+        // It represents a pre-migration `nodes` table on disk, so the whole
+        // point of the test is to upgrade *this exact shape* to the current
+        // schema. Expanding oldSchema silently weakens the regression guard.
+        //
+        // oldSchema mirrors the CREATE TABLE `nodes` DDL in src/db/sqlite.cpp
+        // with all migration-added columns (the entries in the `newCols` vector
+        // inside SqliteDbAccess::openTableWithNodes) removed.
+        const char* oldSchema = "CREATE TABLE nodes ("
+                                " nodehandle int64 PRIMARY KEY NOT NULL,"
+                                " parenthandle int64,"
+                                " name text,"
+                                " fingerprint BLOB,"
+                                " origFingerprint BLOB,"
+                                " type tinyint,"
+                                " share tinyint,"
+                                " fav tinyint,"
+                                " ctime int64,"
+                                " flags int64,"
+                                " counter BLOB NOT NULL,"
+                                " node BLOB NOT NULL)";
+        char* err = nullptr;
+        const int rc = sqlite3_exec(dbGuard.get(), oldSchema, nullptr, nullptr, &err);
+        const std::string errStr = err ? err : "";
+        sqlite3_free(err);
+        ASSERT_EQ(SQLITE_OK, rc) << "Failed to seed old schema: " << errStr;
+    }
+
+    // Run the migration through the SDK's open path.
+    PrnGen rng;
+    std::unique_ptr<DbTable> dbTable{
+        dbAccess.openTableWithNodes(rng, *fsaccess, dbName, 0, nullptr)};
+    // If this fails, openTableWithNodes could not migrate the old schema
+    // to the current one — such as a new VIRTUAL column in `newCols`
+    // (SqliteDbAccess::openTableWithNodes in src/db/sqlite.cpp) referencing
+    // a base column that older DBs don't have. Do NOT "fix" by adding the
+    // base column to oldSchema above — oldSchema is a frozen historical
+    // snapshot, the guard only works if it stays one.
+    ASSERT_TRUE(dbTable) << "Migration failed — openTableWithNodes() returned null";
+    EXPECT_EQ(dbAccess.currentDbVersion, DbAccess::DB_VERSION);
+    dbTable.reset(); // release the DB handle before re-opening for assertions
+
+    // Build a reference DB from scratch and compare column sets. This catches
+    // the case where someone adds a new entry to newCols in sqlite.cpp but
+    // forgets to keep this test in sync — the two sets will diverge.
+    auto refDirPath = std::filesystem::current_path() / "nodes_schema_migration_ref";
+    const MrProper refCleanUp(
+        [refDirPath]()
+        {
+            std::filesystem::remove_all(refDirPath);
+        });
+    std::filesystem::remove_all(refDirPath);
+    std::filesystem::create_directory(refDirPath);
+    LocalPath refFolder = LocalPath::fromAbsolutePath(path_u8string(refDirPath));
+    SqliteDbAccess refDbAccess{refFolder};
+    LocalPath refDbLocalPath = refDbAccess.databasePath(*fsaccess, dbName, DbAccess::DB_VERSION);
+
+    std::unique_ptr<DbTable> refDbTable{
+        refDbAccess.openTableWithNodes(rng, *fsaccess, dbName, 0, nullptr)};
+    ASSERT_TRUE(refDbTable);
+    refDbTable.reset();
+
+    auto readColumnSet = [&openSqlite](const std::string& path)
+    {
+        std::set<std::string> cols;
+        auto [dbGuard, openRc] = openSqlite(path);
+        if (openRc != SQLITE_OK)
+            return cols;
+        sqlite3_stmt* stmt = nullptr;
+        const char* q = "SELECT name FROM pragma_table_xinfo('nodes')";
+        if (sqlite3_prepare_v2(dbGuard.get(), q, -1, &stmt, nullptr) == SQLITE_OK)
+        {
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                cols.emplace(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+            }
+        }
+        sqlite3_finalize(stmt);
+        return cols;
+    };
+
+    const auto migratedCols = readColumnSet(dbPathStr);
+    const auto freshCols = readColumnSet(refDbLocalPath.toPath(false));
+
+    // Guard against false-green: readColumnSet silently returns an empty
+    // set on open / prepare failure or if the `nodes` table is absent.
+    // Without this, two empty sets would trivially compare equal.
+    ASSERT_FALSE(migratedCols.empty()) << "Failed to read columns from migrated DB: " << dbPathStr;
+    ASSERT_FALSE(freshCols.empty())
+        << "Failed to read columns from fresh DB: " << refDbLocalPath.toPath(false);
+
+    // If this fails, the CREATE TABLE DDL and the `newCols` list in
+    // SqliteDbAccess::openTableWithNodes (src/db/sqlite.cpp) are out of
+    // sync — such as a new column added to one but not the other. Any
+    // new column must appear in both so that fresh-create and migrate
+    // paths end up with identical schemas.
+    EXPECT_THAT(migratedCols, ::testing::UnorderedElementsAreArray(freshCols));
+}
+
+#endif // USE_SQLITE
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SQLite-backed node storage tests (listAllNodesByPage cursor-based pagination)
