@@ -17958,8 +17958,8 @@ class MegaApi
         int getCurrentDownloadSpeed();
 
         /**
-         * @brief Return the current download speed
-         * @return Download speed in bytes per second
+         * @brief Return the current upload speed
+         * @return Upload speed in bytes per second
          */
         int getCurrentUploadSpeed();
 
