@@ -243,6 +243,13 @@ TEST(Sqlite, MigratesOldNodesSchema)
     const auto migratedCols = readColumnSet(dbPathStr);
     const auto freshCols = readColumnSet(refDbLocalPath.toPath(false));
 
+    // Guard against false-green: readColumnSet silently returns an empty
+    // set on open / prepare failure or if the `nodes` table is absent.
+    // Without this, two empty sets would trivially compare equal.
+    ASSERT_FALSE(migratedCols.empty()) << "Failed to read columns from migrated DB: " << dbPathStr;
+    ASSERT_FALSE(freshCols.empty())
+        << "Failed to read columns from fresh DB: " << refDbLocalPath.toPath(false);
+
     // If this fails, the CREATE TABLE DDL and the `newCols` list in
     // SqliteDbAccess::openTableWithNodes (src/db/sqlite.cpp) are out of
     // sync — such as a new column added to one but not the other. Any
