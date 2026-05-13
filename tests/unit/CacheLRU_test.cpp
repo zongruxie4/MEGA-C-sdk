@@ -871,3 +871,242 @@ TEST_F(CacheLRU, reduceCacheLRUSize)
     // Root node + rubbish + vault + folder
     ASSERT_EQ(numNodesTotal(), numNodes + 4);
 }
+
+namespace
+{
+constexpr uint32_t kEvictedScenarioLRU = 8;
+constexpr uint32_t kEvictedScenarioChildren = 50;
+
+// Adds more children than the LRU can hold. The earliest-added Nodes
+// get reclaimed; their weak_ptr in the parent's mChildren goes empty
+// but the NodeManagerNode entries stay.
+void addEvictableChildrenUnder(CacheLRU& fx, const std::shared_ptr<mega::Node>& parent)
+{
+    for (uint32_t i = 0; i < kEvictedScenarioChildren; ++i)
+    {
+        const int32_t idx = static_cast<int32_t>(i + 1);
+        fx.addNode(mega::nodetype_t::FILENODE,
+                   parent,
+                   /*notify=*/true,
+                   /*isFetching=*/false,
+                   [idx](mega::Node& file)
+                   {
+                       file.size = idx;
+                       file.owner = 88;
+                       file.ctime = 44;
+                       file.crc[0] = idx;
+                       file.crc[1] = idx;
+                       file.crc[2] = idx;
+                       file.crc[3] = idx;
+                       file.isvalid = true;
+                       file.attrs.map =
+                           std::map<mega::nameid, std::string>{{101, "foo"}, {102, "bar"}};
+                   });
+    }
+}
+
+std::set<mega::NodeHandle> handlesOf(const mega::sharedNode_list& nodes)
+{
+    std::set<mega::NodeHandle> out;
+    for (const auto& n: nodes)
+    {
+        out.insert(n->nodeHandle());
+    }
+
+    return out;
+}
+
+std::set<mega::NodeHandle> expectedHandles(const mega::NodeManagerNode& nmn)
+{
+    std::set<mega::NodeHandle> out;
+    for (const auto& kv: *nmn.mChildren)
+    {
+        out.insert(kv.first);
+    }
+    return out;
+}
+} // namespace
+
+// Adds more children than the LRU can hold under a parent that was
+// loaded from a serialised blob (flag mAllChildrenLoaded = false).
+// The earliest-added children are reclaimed: their weak_ptr in mChildren
+// goes empty but the NodeManagerNode entries stay. getChildren must still
+// return every child the parent has.
+TEST_F(CacheLRU, getChildrenIncludesEvictedChildrenParentFromBlob)
+{
+    auto rootNode = init(kEvictedScenarioLRU);
+
+    // Going through getNodeFromBlob (rather than addNode) is what keeps
+    // the parent in the state this test wants to exercise.
+    std::string parentBlob;
+    {
+        auto& parentRef = mt::makeNode(*mClient,
+                                       mega::nodetype_t::FOLDERNODE,
+                                       mega::NodeHandle().set6byte(mIndex++),
+                                       rootNode.get());
+        std::shared_ptr<mega::Node> tmp(&parentRef);
+        ASSERT_TRUE(tmp->serialize(&parentBlob));
+    }
+
+    auto parent = mClient->mNodeManager.getNodeFromBlob(&parentBlob);
+    ASSERT_NE(parent, nullptr);
+    ASSERT_FALSE(parent->mNodePosition->second.mAllChildrenHandleLoaded);
+
+    addEvictableChildrenUnder(*this, parent);
+
+    auto& parentNMN = parent->mNodePosition->second;
+    ASSERT_FALSE(parentNMN.mAllChildrenHandleLoaded);
+    ASSERT_TRUE(parentNMN.mChildren);
+    ASSERT_EQ(parentNMN.mChildren->size(), kEvictedScenarioChildren);
+    for (auto& kv: *parentNMN.mChildren)
+        ASSERT_NE(kv.second, nullptr);
+    ASSERT_LT(numNodesInCacheLru(), static_cast<uint64_t>(kEvictedScenarioChildren));
+
+    auto returned = mClient->mNodeManager.getChildren(parent.get());
+    EXPECT_EQ(returned.size(), static_cast<size_t>(kEvictedScenarioChildren));
+    EXPECT_EQ(handlesOf(returned), expectedHandles(parentNMN));
+}
+
+// Same eviction scenario as above but the parent is registered via
+// addNode (flag mAllChildrenLoaded = true)
+TEST_F(CacheLRU, getChildrenIncludesEvictedChildrenParentFromAddNode)
+{
+    auto rootNode = init(kEvictedScenarioLRU);
+    auto parent = addNode(mega::nodetype_t::FOLDERNODE,
+                          rootNode,
+                          /*notify=*/false,
+                          /*isFetching=*/true);
+
+    addEvictableChildrenUnder(*this, parent);
+
+    auto& parentNMN = parent->mNodePosition->second;
+    ASSERT_TRUE(parentNMN.mAllChildrenHandleLoaded);
+    ASSERT_TRUE(parentNMN.mChildren);
+    ASSERT_EQ(parentNMN.mChildren->size(), kEvictedScenarioChildren);
+    for (auto& kv: *parentNMN.mChildren)
+        ASSERT_NE(kv.second, nullptr);
+    ASSERT_LT(numNodesInCacheLru(), static_cast<uint64_t>(kEvictedScenarioChildren));
+
+    auto returned = mClient->mNodeManager.getChildren(parent.get());
+    EXPECT_EQ(returned.size(), static_cast<size_t>(kEvictedScenarioChildren));
+    EXPECT_EQ(handlesOf(returned), expectedHandles(parentNMN));
+}
+
+// Two consecutive getChildren calls on the same parent must return the
+// same set of children.
+TEST_F(CacheLRU, getChildrenConsistentAcrossCalls)
+{
+    auto rootNode = init(kEvictedScenarioLRU);
+
+    std::string parentBlob;
+    {
+        auto& parentRef = mt::makeNode(*mClient,
+                                       mega::nodetype_t::FOLDERNODE,
+                                       mega::NodeHandle().set6byte(mIndex++),
+                                       rootNode.get());
+        std::shared_ptr<mega::Node> tmp(&parentRef);
+        ASSERT_TRUE(tmp->serialize(&parentBlob));
+    }
+    auto parent = mClient->mNodeManager.getNodeFromBlob(&parentBlob);
+    ASSERT_NE(parent, nullptr);
+    addEvictableChildrenUnder(*this, parent);
+
+    auto& parentNMN = parent->mNodePosition->second;
+    ASSERT_FALSE(parentNMN.mAllChildrenHandleLoaded);
+
+    auto first = mClient->mNodeManager.getChildren(parent.get());
+    ASSERT_EQ(first.size(), kEvictedScenarioChildren);
+    ASSERT_TRUE(parentNMN.mAllChildrenHandleLoaded);
+
+    auto second = mClient->mNodeManager.getChildren(parent.get());
+    EXPECT_EQ(handlesOf(second), handlesOf(first));
+}
+
+// A child has been moved from parentA to parentB in RAM but the change
+// has not been flushed to the DB yet. The DB still reports the child
+// under parentA. getChildren(parentA) must NOT return the child:
+// getChildren_internal detects that the node is alive under a different
+// parent and skips it.
+TEST_F(CacheLRU, getChildrenSkipsInMemoryMoveNotFlushedToDb)
+{
+    auto rootNode = init(kEvictedScenarioLRU);
+
+    // parentA loaded via blob -> mAllChildrenHandleLoaded == false. This
+    // is the only branch where the move-not-flushed check is reached.
+    std::string parentBlob;
+    {
+        auto& parentRef = mt::makeNode(*mClient,
+                                       mega::nodetype_t::FOLDERNODE,
+                                       mega::NodeHandle().set6byte(mIndex++),
+                                       rootNode.get());
+        std::shared_ptr<mega::Node> tmp(&parentRef);
+        ASSERT_TRUE(tmp->serialize(&parentBlob));
+    }
+    auto parentA = mClient->mNodeManager.getNodeFromBlob(&parentBlob);
+    ASSERT_NE(parentA, nullptr);
+    ASSERT_FALSE(parentA->mNodePosition->second.mAllChildrenHandleLoaded);
+
+    auto parentB = addNode(mega::nodetype_t::FOLDERNODE, rootNode, false, true);
+    ASSERT_NE(parentB, nullptr);
+
+    // child created and persisted under parentA: DB records parent == A.
+    auto child = addNode(mega::nodetype_t::FILENODE, parentA, true, false);
+    const mega::NodeHandle childHandle = child->nodeHandle();
+
+    // RAM-only move parentA -> parentB. setparent updates parenthandle
+    // and mChildren of both parents via NodeManager::removeChild/addChild.
+    // saveNodeInDb is intentionally NOT called: DB still says parent == A.
+    ASSERT_TRUE(child->setparent(parentB, /*updateNodeCounters=*/false));
+    ASSERT_EQ(child->parentHandle(), parentB->nodeHandle());
+
+    // child must remain alive in RAM so the fix's branch can observe it.
+    ASSERT_NE(child->mNodePosition->second.getNodeInRam(false), nullptr);
+
+    auto childrenA = mClient->mNodeManager.getChildren(parentA.get());
+    EXPECT_TRUE(childrenA.empty())
+        << "child must not be returned under parentA after RAM-only move";
+
+    auto childrenB = mClient->mNodeManager.getChildren(parentB.get());
+    ASSERT_EQ(childrenB.size(), 1u);
+    EXPECT_EQ(childrenB.front()->nodeHandle(), childHandle);
+}
+
+// Explicit uniqueness guarantee: under eviction, getChildren must not
+// return the same child twice. A regression where a live child is
+// counted both by the in-RAM first loop and by the DB-deserialized
+// second loop would surface as duplicate handles in the result.
+TEST_F(CacheLRU, getChildrenReturnsNoDuplicatesAfterEviction)
+{
+    auto rootNode = init(kEvictedScenarioLRU);
+
+    std::string parentBlob;
+    {
+        auto& parentRef = mt::makeNode(*mClient,
+                                       mega::nodetype_t::FOLDERNODE,
+                                       mega::NodeHandle().set6byte(mIndex++),
+                                       rootNode.get());
+        std::shared_ptr<mega::Node> tmp(&parentRef);
+        ASSERT_TRUE(tmp->serialize(&parentBlob));
+    }
+    auto parent = mClient->mNodeManager.getNodeFromBlob(&parentBlob);
+    ASSERT_NE(parent, nullptr);
+    ASSERT_FALSE(parent->mNodePosition->second.mAllChildrenHandleLoaded);
+
+    addEvictableChildrenUnder(*this, parent);
+
+    // The LRU is small enough that some children are evicted while the
+    // most recent ones remain alive: the result mixes both populations.
+    ASSERT_LT(numNodesInCacheLru(), static_cast<uint64_t>(kEvictedScenarioChildren));
+
+    auto returned = mClient->mNodeManager.getChildren(parent.get());
+
+    std::set<mega::NodeHandle> seen;
+    for (const auto& n: returned)
+    {
+        ASSERT_NE(n, nullptr);
+        EXPECT_TRUE(seen.insert(n->nodeHandle()).second)
+            << "duplicate handle in getChildren result";
+    }
+    EXPECT_EQ(seen.size(), returned.size());
+    EXPECT_EQ(returned.size(), static_cast<size_t>(kEvictedScenarioChildren));
+}
