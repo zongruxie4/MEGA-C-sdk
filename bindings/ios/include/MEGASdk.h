@@ -59,6 +59,8 @@
 #import "MEGASearchFilter.h"
 #import "MEGASearchFilterTimeFrame.h"
 #import "MEGASearchPage.h"
+#import "MEGAListAllNodesFilter.h"
+#import "MEGASearchCursorOffset.h"
 #import "PasswordNodeData.h"
 #import "MEGANotification.h"
 #import "MEGACancelSubscriptionReasonList.h"
@@ -8068,6 +8070,47 @@ typedef NS_ENUM(NSInteger, PasswordManagerNodeType) {
  * @return List of nodes that contain the desired string in their name.
  */
 - (MEGANodeList *)searchNonRecursivelyWith:(MEGASearchFilter *)filter orderType:(MEGASortOrderType)orderType page:(nullable MEGASearchPage *)page cancelToken:(MEGACancelToken *)cancelToken;
+
+/**
+ * @brief List nodes matching a MEGAListAllNodesFilter using cursor-based pagination.
+ *
+ * Unlike searchWith: which traverses a caller-supplied subtree, this method
+ * queries the nodes table with a flat query and applies the ancestor restriction
+ * via an EXISTS up-walk, making it significantly faster for global pagination
+ * use-cases. File versions are always excluded. Cursor-based pagination
+ * guarantees that no items are skipped if nodes are deleted between page
+ * requests.
+ *
+ * Supported sort orders:
+ *   - MEGAOrderTypeDefaultAsc      / MEGAOrderTypeDefaultDesc
+ *   - MEGAOrderTypeSizeAsc         / MEGAOrderTypeSizeDesc
+ *   - MEGAOrderTypeModificationAsc / MEGAOrderTypeModificationDesc
+ *   - MEGAOrderTypeLabelAsc        / MEGAOrderTypeLabelDesc
+ *   - MEGAOrderTypeFavouriteAsc    / MEGAOrderTypeFavouriteDesc
+ *
+ * The call returns an empty list and logs a warning when:
+ *   - filter is nil.
+ *   - filter.category is MEGANodeFormatTypeUnknown.
+ *   - orderType is outside the supported set.
+ *   - cursor is inconsistent with orderType (missing the required field).
+ *
+ * @param filter      Filter describing the mime category and optional ancestor /
+ *                    sensitivity constraint. Must not be nil.
+ * @param orderType   Sort order constant.
+ * @param maxElements Maximum number of nodes to return per page (0 = no limit).
+ * @param cursor      Cursor from the last node of the previous page, or nil for
+ *                    the first page. Required fields depend on orderType — see
+ *                    MEGASearchCursorOffset.
+ * @param cancelToken Cancellation token; may be nil.
+ *
+ * @return List of nodes for this page, or an empty list when there are no more
+ *         results or inputs were rejected.
+ */
+- (MEGANodeList *)listAllNodesByPageWithFilter:(MEGAListAllNodesFilter *)filter
+                                     orderType:(MEGASortOrderType)orderType
+                                   maxElements:(NSUInteger)maxElements
+                                        cursor:(nullable MEGASearchCursorOffset *)cursor
+                                   cancelToken:(MEGACancelToken *)cancelToken;
 
 /// Get a list of buckets, each bucket containing a list of recently added/modified nodes
 ///

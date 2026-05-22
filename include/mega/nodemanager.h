@@ -292,6 +292,54 @@ struct NodeSearchCursorOffset
     std::optional<int> mLastFav; ///< fav flag for FAV_ASC / FAV_DESC
 };
 
+// Mirrors MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT (== 1).
+// A static_assert in megaapi_impl.cpp enforces the value match.
+constexpr int kDefaultListAllLocationScope = 1;
+
+// Mirrors MegaListAllNodesFilter::MAX_LOCATION_HANDLES (== 3).
+// The DB layer uses this as the IN-list cap for filesRoots / excludeHandles.
+// A static_assert in megaapi_impl.cpp enforces the value match.
+constexpr size_t kListAllMaxLocationHandles = 3;
+
+/**
+ * @brief Filter + pagination state for listAllNodesByPage, threaded through
+ *        MegaApiImpl → NodeManager → DbTable → SqliteAccountState.
+ *
+ * Grouped so future filter fields can be added without churning four signatures.
+ *
+ * Root selection (resolved at NodeManager, which owns rootnodes):
+ *   - explicitAncestors non-empty → used verbatim as the root set.
+ *   - explicitAncestors empty     → locationScope picks among rootnodes:
+ *       LOCATION_CLOUD_DRIVE                    → {files}
+ *       LOCATION_CLOUD_DRIVE_AND_VAULT          → {files, vault}  (default)
+ *       LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH  → {files, vault, rubbish}
+ *
+ * excludeHandles is applied independently: a node is dropped when any handle
+ * in the list appears in its ancestor chain (inclusive of the node itself
+ * and the matched root).
+ *
+ * explicitAncestors and excludeHandles are each capped at
+ * kListAllMaxLocationHandles.
+ */
+struct ListAllNodesParams
+{
+    MimeType_t mimeType = MIME_TYPE_UNKNOWN;
+    int order = 0;
+    size_t maxElements = 0;
+    bool excludeSensitive = false;
+    std::optional<NodeSearchCursorOffset> cursor;
+
+    /// byLocationHandles — empty means use locationScope.
+    std::vector<NodeHandle> explicitAncestors;
+
+    /// byExcludeLocationHandles — empty means disabled.
+    std::vector<NodeHandle> excludeHandles;
+
+    /// byLocation — only consulted when explicitAncestors is empty.
+    /// Mirrors MegaListAllNodesFilter::LOCATION_*.
+    int locationScope = kDefaultListAllLocationScope;
+};
+
 /**
  * @brief The NodeManager class
  *
@@ -349,33 +397,23 @@ public:
         const std::optional<NodeSearchLexicographicalOffset>& offset);
 
     /**
-     * @brief List all nodes (or all nodes of a given type) using cursor-based pagination.
+     * @brief List one page of nodes for listAllNodesByPage.
      *
-     * This is a simple flat query over the entire nodes table – no recursive CTE, no subtree
-     * restriction.  It is intended for mobile pagination scenarios where offset-based paging
-     * would silently skip items when nodes are deleted between pages.
+     * Flat query over the nodes table; results are restricted to the
+     * caller-chosen root set via an EXISTS up-walk (no subtree traversal).
+     * Versions are always excluded. Cursor-based pagination guarantees no
+     * items are skipped when nodes are deleted between pages.
      *
-     * @param order       One of ORDER_DEFAULT_ASC/DESC, ORDER_SIZE_ASC/DESC,
-     *                    ORDER_MODIFICATION_ASC/DESC, ORDER_LABEL_ASC/DESC, ORDER_FAV_ASC/DESC.
-     * @param cancelFlag  Optional cancellation token.
-     * @param maxElements Page size (0 = no limit).
-     * @param cursor      Cursor built from the last node of the previous page, or std::nullopt
-     *                    for the first page.  The fields that must be populated depend on the
-     *                    sort order – see NodeSearchCursorOffset.
-     * @return            Vector of matching nodes.
+     * Filter semantics — mime, order, cursor, sensitivity, root selection
+     * from explicitAncestors / locationScope, and excludeHandles — are
+     * documented on ListAllNodesParams. UNDEF rootnodes (e.g. Vault not
+     * provisioned) are skipped during root resolution.
+     *
+     * @return Matching nodes for this page; empty on DB error, empty
+     *         result, no valid root resolved (e.g. rootnodes not yet
+     *         populated), or end of pagination.
      */
-    sharedNode_vector listAllNodesByPage(MimeType_t mimeType,
-                                         int order,
-                                         CancelToken cancelFlag,
-                                         size_t maxElements,
-                                         const std::optional<NodeSearchCursorOffset>& cursor);
-
-    sharedNode_vector
-        listAllNodesByPage_internal(MimeType_t mimeType,
-                                    int order,
-                                    CancelToken cancelFlag,
-                                    size_t maxElements,
-                                    const std::optional<NodeSearchCursorOffset>& cursor);
+    sharedNode_vector listAllNodesByPage(const ListAllNodesParams& params, CancelToken cancelFlag);
 
     /*
      * @brief
@@ -557,6 +595,11 @@ public:
     size_t getChildScanDbThreshold() const;
 
 private:
+    // Maps params.explicitAncestor to 1..2 non-UNDEF root handles: explicit ancestor
+    // when set, otherwise default {Cloud, Vault} scope. Empty result means "no valid
+    // root resolvable" — caller must reject.
+    std::vector<NodeHandle> resolveListAllRoots(const ListAllNodesParams& params) const;
+
     class NoKeyLogger
     {
     public:

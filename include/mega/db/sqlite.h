@@ -146,12 +146,10 @@ public:
 
     void updateCounter(NodeHandle nodeHandle, const std::string& nodeCounterBlob) override;
     void updateCounterAndFlags(NodeHandle nodeHandle, uint64_t flags, const std::string& nodeCounterBlob) override;
-    bool listAllNodesByPage(MimeType_t mimeType,
-                            int order,
+    bool listAllNodesByPage(const ListAllNodesParams& params,
+                            const std::vector<NodeHandle>& filesRoots,
                             std::vector<std::pair<NodeHandle, NodeSerialized>>& nodes,
-                            CancelToken cancelFlag,
-                            size_t maxElements,
-                            const std::optional<NodeSearchCursorOffset>& cursor) override;
+                            CancelToken cancelFlag) override;
 
     void createIndexes(bool enableIndexesForSearching,
                        bool enableIndexesForLexicographicalList) override;

@@ -10899,6 +10899,162 @@ public:
 };
 
 /**
+ * @brief Filter for MegaApi::listAllNodesByPage.
+ *
+ * Deliberately narrower than MegaSearchFilter: only exposes the fields the
+ * flat, cursor-paginated listAllNodesByPage query can actually honour. New
+ * fields (byName, byTag, byDescription, byFavourite, time windows, byNodeType,
+ * text-search operators) are intentionally absent — use MegaApi::search /
+ * MegaApi::getChildren when those are required.
+ *
+ * Scope (resolved in priority order):
+ *   - byLocationHandles set (non-empty) → results are the union of the
+ *     descendant subtrees of the supplied ancestor handles (max 3). If a
+ *     handle points into Rubbish or an in-share, those descendants will be
+ *     returned (Rubbish/in-share exclusion only applies to the default
+ *     scope below).
+ *   - byLocationHandles unset (or empty) → byLocation selects which root
+ *     nodes are walked:
+ *       LOCATION_CLOUD_DRIVE                    → Cloud Drive only.
+ *       LOCATION_CLOUD_DRIVE_AND_VAULT (default) → Cloud Drive + Vault
+ *                                                  (My Backups), matches
+ *                                                  MegaApi::search with
+ *                                                  SEARCH_TARGET_ROOTNODE.
+ *       LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH  → Cloud + Vault + Rubbish.
+ *
+ * Exclude list:
+ *   - byExcludeLocationHandles (max 3) is applied on top of the scope above.
+ *     Any node whose ancestor chain — including the node itself and the
+ *     matched root — contains any of these handles is dropped. Setting the
+ *     Vault root in this list therefore drops the entire Vault subtree.
+ *
+ * File versions (FILENODE whose parent is also a FILENODE) are always excluded
+ * regardless of scope.
+ *
+ * Sensitivity:
+ *   - SENSITIVITY_SHOW_ALL (default) → no filtering.
+ *   - SENSITIVITY_HIDE_SENSITIVE → hide nodes whose own SENSITIVE flag, or
+ *     any strict ancestor's flag below the matched root, is set. The matched
+ *     root's own flag is intentionally ignored.
+ *
+ * Cursor validity: a cursor built from a previous page is only reusable when
+ * the filter's (byCategory, byLocation, byLocationHandles,
+ * byExcludeLocationHandles, bySensitivity) tuple and the sort order all match
+ * the original call. Mixing configurations may skip or duplicate entries —
+ * restart pagination when any of these change.
+ */
+class MegaListAllNodesFilter
+{
+protected:
+    MegaListAllNodesFilter();
+
+public:
+    enum
+    {
+        SENSITIVITY_SHOW_ALL = 0, ///< No sensitivity filtering (default).
+        SENSITIVITY_HIDE_SENSITIVE = 1, ///< Hide sensitive nodes.
+    };
+
+    /**
+     * @brief Rootnode scope selector for byLocation().
+     *
+     * Used when byLocationHandles is unset/empty. Picks which of the three
+     * account rootnodes are walked.
+     */
+    enum
+    {
+        LOCATION_CLOUD_DRIVE = 0, ///< Cloud Drive only.
+        LOCATION_CLOUD_DRIVE_AND_VAULT = 1, ///< Cloud Drive + Vault (default).
+        LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH = 2, ///< All three rootnodes.
+    };
+
+    /// Maximum number of handles accepted by byLocationHandles() and
+    /// byExcludeLocationHandles(). Lists exceeding this size cause
+    /// listAllNodesByPage to reject the request.
+    static constexpr size_t MAX_LOCATION_HANDLES = 3;
+
+    /**
+     * @brief Creates a new instance of MegaListAllNodesFilter.
+     * @return A pointer to the private subclass. Caller takes ownership.
+     */
+    static MegaListAllNodesFilter* createInstance();
+
+    /**
+     * @brief Create a copy of this instance. The caller takes ownership.
+     */
+    virtual MegaListAllNodesFilter* copy() const;
+
+    virtual ~MegaListAllNodesFilter();
+
+    /**
+     * @brief Required. MIME type category (see MegaApi::FILE_TYPE_* constants).
+     *
+     * Must be a non-DEFAULT value in [FILE_TYPE_DEFAULT+1, FILE_TYPE_LAST].
+     * listAllNodesByPage rejects FILE_TYPE_DEFAULT (returns empty, logs warning).
+     */
+    virtual void byCategory(int mimeType);
+    virtual int byCategory() const;
+
+    /**
+     * @brief Optional. Restrict results to descendants of one or more
+     *        ancestor handles (union, max MAX_LOCATION_HANDLES = 3).
+     *
+     * Pass nullptr or an empty list (default) to use the rootnode scope
+     * selected by byLocation(). Lists with more than MAX_LOCATION_HANDLES
+     * entries, or with any INVALID_HANDLE entry, cause listAllNodesByPage to
+     * reject the request.
+     *
+     * The supplied list is copied; the caller retains ownership of the
+     * MegaHandleList. The getter returns a new MegaHandleList that the
+     * caller must delete.
+     */
+    virtual void byLocationHandles(const MegaHandleList* ancestorHandles);
+    virtual MegaHandleList* byLocationHandles() const;
+
+    /**
+     * @brief Optional. Drop nodes whose ancestor chain contains any of the
+     *        supplied handles (max MAX_LOCATION_HANDLES = 3).
+     *
+     * "Ancestor chain" is inclusive of the node itself and of the matched
+     * root: setting a root handle here drops its entire subtree.
+     *
+     * Applied independently of byLocationHandles / byLocation. Pass nullptr or
+     * an empty list (default) to disable. Same size and INVALID_HANDLE rules
+     * as byLocationHandles.
+     *
+     * The supplied list is copied; the caller retains ownership of the
+     * MegaHandleList. The getter returns a new MegaHandleList that the
+     * caller must delete.
+     */
+    virtual void byExcludeLocationHandles(const MegaHandleList* excludeHandles);
+    virtual MegaHandleList* byExcludeLocationHandles() const;
+
+    /**
+     * @brief Optional. Rootnode scope selector. Ignored when byLocationHandles
+     *        is set (non-empty).
+     *
+     * @param scope One of LOCATION_CLOUD_DRIVE,
+     *              LOCATION_CLOUD_DRIVE_AND_VAULT (default),
+     *              LOCATION_CLOUD_DRIVE_VAULT_AND_RUBBISH.
+     * Other values cause listAllNodesByPage to reject the request.
+     */
+    virtual void byLocation(int scope);
+    virtual int byLocation() const;
+
+    /**
+     * @brief Optional. Sensitivity filter.
+     *
+     * @param filterOption One of:
+     *   - SENSITIVITY_SHOW_ALL (default) — no filtering.
+     *   - SENSITIVITY_HIDE_SENSITIVE — hide sensitive nodes as described
+     *     in the class docs.
+     * Invalid values are ignored (behaviour retained from MegaSearchFilter).
+     */
+    virtual void bySensitivity(int filterOption);
+    virtual int bySensitivity() const;
+};
+
+/**
  * @brief Store pagination options used in searches @see MegaApi::search, MegaApi::getChildren.
  *
  */
@@ -17802,8 +17958,8 @@ class MegaApi
         int getCurrentDownloadSpeed();
 
         /**
-         * @brief Return the current download speed
-         * @return Download speed in bytes per second
+         * @brief Return the current upload speed
+         * @return Upload speed in bytes per second
          */
         int getCurrentUploadSpeed();
 
@@ -20306,25 +20462,47 @@ class MegaApi
         /**
          * @brief List all nodes using cursor-based pagination with MIME type filtering.
          *
-         * Unlike search() which traverses a subtree, this method queries the
-         * entire nodes table with a simple flat query.  This makes it significantly faster for
-         * global pagination use-cases.
+         * @deprecated Use listAllNodesByPage(const MegaListAllNodesFilter*, ...)
+         *             instead. The filter-based overload exposes byLocationHandles,
+         *             byExcludeLocationHandles, byLocation and bySensitivity and
+         *             is the contract that will be maintained going forward.
          *
-         * Cursor-based pagination guarantees that no items are skipped if nodes are deleted
-         * between page requests, unlike the offset-based search().
+         * This overload is now a thin wrapper around the filter-based overload: it
+         * builds a default MegaListAllNodesFilter, applies byCategory(@p mimeType),
+         * and forwards. All other filter fields use their defaults — scope
+         * MegaListAllNodesFilter::LOCATION_CLOUD_DRIVE_AND_VAULT (Cloud Drive +
+         * Vault, widened from the previous Cloud-only behaviour to match
+         * MegaApi::search's SEARCH_TARGET_ROOTNODE semantics), no
+         * byLocationHandles, no byExcludeLocationHandles, and
+         * SENSITIVITY_SHOW_ALL.
+         *
+         * Unlike search() which traverses a subtree, this method queries the
+         * entire nodes table with a flat query and applies the rootnode
+         * restriction via an EXISTS up-walk, making it significantly faster for
+         * global pagination use-cases. File versions are always excluded.
+         *
+         * Cursor-based pagination guarantees that no items are skipped if nodes
+         * are deleted between page requests, unlike the offset-based search().
          *
          * Supported sort orders:
-         *   - ORDER_DEFAULT_ASC  / ORDER_DEFAULT_DESC
-         *   - ORDER_SIZE_ASC     / ORDER_SIZE_DESC
+         *   - ORDER_DEFAULT_ASC      / ORDER_DEFAULT_DESC
+         *   - ORDER_SIZE_ASC         / ORDER_SIZE_DESC
          *   - ORDER_MODIFICATION_ASC / ORDER_MODIFICATION_DESC
-         *   - ORDER_LABEL_ASC    / ORDER_LABEL_DESC
-         *   - ORDER_FAV_ASC      / ORDER_FAV_DESC
+         *   - ORDER_LABEL_ASC        / ORDER_LABEL_DESC
+         *   - ORDER_FAV_ASC          / ORDER_FAV_DESC
          *
-         * To build a cursor for the next page, populate a MegaSearchCursorOffset from the last
-         * MegaNode in the returned list.  The fields required depend on the sort order; see
-         * MegaSearchCursorOffset for details.
+         * To build a cursor for the next page, populate a MegaSearchCursorOffset
+         * from the last MegaNode in the returned list. The fields required
+         * depend on the sort order; see MegaSearchCursorOffset for details.
          *
-         * For best performance, ensure search DB indexes are enabled (they are by default):
+         * Rejection behaviour is inherited from the filter-based overload: an
+         * empty list is returned and a warning is logged when @p mimeType is
+         * FILE_TYPE_DEFAULT, when @p order is outside the supported set, or
+         * when @p cursor is inconsistent with @p order. See
+         * listAllNodesByPage(const MegaListAllNodesFilter*, ...) for the full
+         * list.
+         *
+         * For best performance, ensure search DB indexes are enabled (default):
          * @code
          *   megaApi->enableSearchDBIndexes(true);
          * @endcode
@@ -20339,12 +20517,85 @@ class MegaApi
          * @param cancelToken  Optional cancellation token; may be null.
          * @param maxElements  Maximum number of nodes to return per page (0 = no limit).
          * @param cursor       Cursor from the last node of the previous page, or nullptr for the
-         *                     first page.
+         *                     first page. Fields required depend on the sort order — see
+         *                     MegaSearchCursorOffset.
          *
          * @return List of MegaNode objects for this page, or an empty list when there are no more
-         *         results.  The caller takes ownership and must delete the returned object.
+         *         results or inputs were rejected. The caller takes ownership and must delete the
+         *         returned object.
          */
         MegaNodeList* listAllNodesByPage(int mimeType,
+                                         int order,
+                                         MegaCancelToken* cancelToken,
+                                         size_t maxElements,
+                                         const MegaSearchCursorOffset* cursor);
+
+        /**
+         * @brief List nodes matching a MegaListAllNodesFilter using cursor-based
+         *        pagination.
+         *
+         * Unlike search() which walks a caller-supplied subtree, this method queries
+         * the nodes table with a flat query and applies the ancestor restriction via
+         * an EXISTS up-walk, making it significantly faster for global pagination
+         * use-cases. File versions are always excluded. Cursor-based pagination
+         * guarantees that no items are skipped if nodes are deleted between page
+         * requests, unlike the offset-based search().
+         *
+         * See MegaListAllNodesFilter for the exact set of honoured filter fields and
+         * the semantics of byLocationHandles / byExcludeLocationHandles / byLocation
+         * / bySensitivity.
+         *
+         * Supported sort orders (@p order):
+         *   - ORDER_DEFAULT_ASC      / ORDER_DEFAULT_DESC
+         *   - ORDER_SIZE_ASC         / ORDER_SIZE_DESC
+         *   - ORDER_MODIFICATION_ASC / ORDER_MODIFICATION_DESC
+         *   - ORDER_LABEL_ASC        / ORDER_LABEL_DESC
+         *   - ORDER_FAV_ASC          / ORDER_FAV_DESC
+         *
+         * The call returns an empty list and logs a warning when:
+         *   - @p filter is nullptr.
+         *   - @p filter->byCategory() is FILE_TYPE_DEFAULT or otherwise outside
+         *     the FILE_TYPE_* range.
+         *   - @p filter->byLocation() is set to a value outside the
+         *     MegaListAllNodesFilter::LOCATION_* range.
+         *   - byLocationHandles or byExcludeLocationHandles exceeds
+         *     MegaListAllNodesFilter::MAX_LOCATION_HANDLES, or contains an
+         *     INVALID_HANDLE entry.
+         *   - @p order is outside the supported set.
+         *   - @p cursor is supplied but its order-independent fields are
+         *     missing or invalid: getLastName() is null/empty, or
+         *     getLastHandle() is INVALID_HANDLE.
+         *   - @p cursor is supplied and the field required by @p order is
+         *     missing or out of range:
+         *       * ORDER_SIZE_*         → getLastSize() < 0
+         *       * ORDER_MODIFICATION_* → getLastMtime() < 0
+         *       * ORDER_LABEL_*        → getLastLabel() outside
+         *                                [NODE_LBL_UNKNOWN, NODE_LBL_GREY]
+         *       * ORDER_FAV_*          → getLastFav() not 0 or 1
+         *     ORDER_DEFAULT_* requires no extra field beyond lastName /
+         *     lastHandle.
+         *
+         * For best performance, ensure search DB indexes are enabled (default):
+         * @code
+         *   megaApi->enableSearchDBIndexes(true);
+         * @endcode
+         *
+         * @param filter       Filter describing the mime category, optional
+         *                     byLocationHandles / byExcludeLocationHandles,
+         *                     byLocation and sensitivity constraints. Must not
+         *                     be nullptr.
+         * @param order        Sort order constant (see supported values above).
+         * @param cancelToken  Optional cancellation token; may be null.
+         * @param maxElements  Maximum number of nodes to return per page (0 = no limit).
+         * @param cursor       Cursor from the last node of the previous page, or
+         *                     nullptr for the first page. Fields required depend on
+         *                     the sort order — see MegaSearchCursorOffset.
+         *
+         * @return List of MegaNode objects for this page, or an empty list when there
+         *         are no more results or inputs were rejected. The caller takes
+         *         ownership and must delete the returned object.
+         */
+        MegaNodeList* listAllNodesByPage(const MegaListAllNodesFilter* filter,
                                          int order,
                                          MegaCancelToken* cancelToken,
                                          size_t maxElements,

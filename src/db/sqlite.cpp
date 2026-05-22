@@ -21,6 +21,7 @@
 
 #include "mega.h"
 
+#include <algorithm>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -2441,7 +2442,7 @@ bool SqliteAccountState::searchNodes(const NodeSearchFilter& filter,
     }
 
     constexpr uint64_t versionFlag = (1 << Node::FLAGS_IS_VERSION); // exclude file versions
-    constexpr uint64_t senstivityFlag = 1 << Node::FLAGS_IS_MARKED_SENSTIVE; // by sensitivity
+    constexpr uint64_t sensitivityFlag = 1 << Node::FLAGS_IS_MARKED_SENSITIVE; // by sensitivity
 
     const auto& ancestors = filter.byAncestorHandles();
     const sqlite3_int64 pageSize = page.size() ? static_cast<sqlite3_int64>(page.size()) : -1;
@@ -2458,7 +2459,7 @@ bool SqliteAccountState::searchNodes(const NodeSearchFilter& filter,
     bindValue(sqlResult, stmt, idPageOff, page.startingOffset(), sqlite3_bind_int64);
     bindPointer(sqlResult, stmt, idFilter, &filterCopy, NodeSearchFilterPtrStr);
     bindValue(sqlResult, stmt, idSens, filter.bySensitivity(), sqlite3_bind_int);
-    bindValue(sqlResult, stmt, idSensFlag, senstivityFlag, sqlite3_bind_int64);
+    bindValue(sqlResult, stmt, idSensFlag, sensitivityFlag, sqlite3_bind_int64);
 
     const bool result = (sqlResult == SQLITE_OK) && processSqlQueryNodes(stmt, nodes);
 
@@ -2515,24 +2516,71 @@ std::string buildOrderByForListAll(int order)
 }
 
 // Parameter slot layout for listAllNodesByPage:
-//   ?1       = LIMIT (pageSize)   — always
-//   ?2       = mimeFilter         — only when mimeFilterNeedsParam == true
-//   ?2 or ?3 = cursor fields      — only when hasCursor == true
-//                (cursorStartParam = 2 + mimeFilterNeedsParam)
+//   ?1                              = LIMIT (always)
+//   ?2                              = mimeFilter      (omitted for grouped mime types)
+//   ?filesRootParam     .. +N-1     = filesRoots      (N = numRoots ≥ 1)
+//   ?excludeHandleParam .. +M-1     = excludeHandles  (M = numExcludes, may be 0)
+//   ?cursorStartParam onward        = cursor fields   (only if hasCursor)
 //
-// Group mime types (ALL_DOCS, ALL_VISUAL_MEDIA) are expanded into one CTE per concrete
-// mime type with literal WHERE clauses, so they do not consume a parameter slot
-// (mimeFilterNeedsParam == false).
+// Grouped mime types (ALL_DOCS, ALL_VISUAL_MEDIA) bake the mimetype as a literal in
+// per-route CTEs, so they do not consume slot ?2.
 
 static const QueryTagId kLaIdPageSize{1};
+
+// Upper bounds on the filesRoots and excludeHandles IN-lists embedded in the SQL;
+// also cap cache-key packing in computeListAllCacheId.
+constexpr size_t kListAllMaxRoots = kListAllMaxLocationHandles;
+constexpr size_t kListAllMaxExcludes = kListAllMaxLocationHandles;
+
+// Cache key for mStmtListAllNodesByPage. Each input is one
+// "digit" in a positional number, with a different base per
+// digit (its declared range). Every valid combination maps
+// to a unique key — distinct SQL shapes never collide on one
+// prepared statement (numRoots / numExcludes set IN-list
+// arity; excludeSensitive gates a WHERE clause).
+//
+// locationScope is omitted: it only picks rootnodes; SQL
+// depends only on numRoots.
+//
+// Example — first page of photos (mimeType=1, order=1,
+// hasCursor=0, sens=0, numRoots=1, numExcludes=0):
+//   key = 1
+//   key = key * 21 + 1 = 22     // order, base 21
+//   key = key * 2  + 0 = 44     // hasCursor, base 2
+//   key = key * 2  + 0 = 88     // excludeSensitive, base 2
+//   key = key * 3  + 0 = 264    // numRoots-1, base 3
+//   key = key * 4  + 0 = 1056   // numExcludes, base 4
+// → 1056
+inline size_t computeListAllCacheId(MimeType_t mimeType,
+                                    int order,
+                                    bool hasCursor,
+                                    bool excludeSensitive,
+                                    size_t numRoots,
+                                    size_t numExcludes)
+{
+    static_assert(OrderByClause::FAV_DESC == 20, "FAV_DESC changed; update kListAllOrderStride");
+    constexpr size_t kListAllOrderStride = static_cast<size_t>(OrderByClause::FAV_DESC) + 1;
+
+    assert(static_cast<size_t>(order) < kListAllOrderStride);
+    assert(numRoots > 0 && numRoots <= kListAllMaxRoots);
+    assert(numExcludes <= kListAllMaxExcludes);
+
+    size_t key = static_cast<size_t>(mimeType);
+    key = key * kListAllOrderStride + static_cast<size_t>(order);
+    key = key * 2 + (hasCursor ? 1u : 0u);
+    key = key * 2 + (excludeSensitive ? 1u : 0u);
+    key = key * kListAllMaxRoots + (numRoots - 1);
+    key = key * (kListAllMaxExcludes + 1) + numExcludes;
+    return key;
+}
 
 // SQL fragment for the computed isZero column used by LABEL sort orders.
 static const std::string kLabelIsZeroExpr = "(CASE WHEN label = 0 THEN 1 ELSE 0 END)";
 
-// Range pre-filter on the primary sort key(s) so SQLite can seek to the cursor position
-// via an index rather than scanning all preceding rows. For low-cardinality keys (FAV,
-// LABEL, SIZE, MTIME) the secondary key (name) is also included to handle collisions.
-// handle is not used here (left to the cursor WHERE for exact tie-breaking).
+// Range pre-filter on the primary sort key(s) so SQLite can seek to the cursor row
+// via an index rather than scanning everything before it. The secondary key (name)
+// is included for multi-key orders to absorb ties; exact tie-breaking on nodehandle
+// is left to buildCursorWhereForListAll.
 // Slots used by this function:
 //   DEFAULT_ASC/DESC  : p1=name
 //   SIZE_ASC/DESC     : p1=size,   p2=name
@@ -2853,15 +2901,198 @@ std::string buildWhereClauseForListAll(const std::vector<std::string>& condition
     return whereClause;
 }
 
+// Guard the constants baked into the SQL text below. If these ever change, bump the
+// literals in buildListAllRouteSelect / buildUpWalkExists to match.
+static_assert(Node::FLAGS_IS_VERSION == 0,
+              "FLAGS_IS_VERSION changed; update listAllNodesByPage SQL literals");
+static_assert(Node::FLAGS_IS_MARKED_SENSITIVE == 2,
+              "FLAGS_IS_MARKED_SENSITIVE changed; update listAllNodesByPage SQL literals");
+
+// EXISTS clause: walks the parent chain of the outer `nodes AS n` row and is true
+// iff it reaches any handle in slots ?<filesRootParam>..?<filesRootParam+numRoots-1>.
+// Outer FROM must alias nodes as `n`. Assumes no cycles. Caller guarantees no UNDEF
+// in the bound roots, so the post-rootnode `up.h = UNDEF` row fails IN(...) naturally.
+//
+// excludeSensitive: walks `sensSeen` (OR of the sensitive bit) over n inclusive up to
+// the matched root EXCLUSIVE — the root's own flag is ignored, matching
+// searchNodesByMimetype. Final SELECT requires sensSeen = 0.
+//
+// excludeHandles: when numExcludes > 0, walks `excSeen` and rejects rows whose chain
+// (including the matched root) hits the exclude list — dropping a root drops its
+// subtree. When numExcludes == 0, no exc fragments are emitted.
+struct ExcludeSqlFragments
+{
+    std::string columnDecl; // ", excSeen" or empty
+    std::string initial; // initial value for excSeen on first CTE row
+    std::string step; // recursive step value for excSeen
+    std::string recursiveCut; // optional pruning in recursive WHERE
+    std::string outerWhere; // outer SELECT filter rejecting matched roots
+};
+
+ExcludeSqlFragments buildExcludeFragment(int excludeHandleParam, size_t numExcludes)
+{
+    if (numExcludes == 0)
+        return {};
+
+    std::string inList;
+    for (size_t i = 0; i < numExcludes; ++i)
+    {
+        if (i > 0)
+            inList += ", ";
+        inList += "?";
+        inList += std::to_string(excludeHandleParam + static_cast<int>(i));
+    }
+
+    return {
+        ", excSeen",
+        ", (n.nodehandle IN (" + inList + "))",
+        ", up.excSeen OR (p.nodehandle IN (" + inList + "))",
+        " AND up.excSeen = 0",
+        " AND up.excSeen = 0 AND up.h NOT IN (" + inList + ")",
+    };
+}
+
+std::string buildUpWalkExists(int filesRootParam,
+                              size_t numRoots,
+                              bool excludeSensitive,
+                              int excludeHandleParam,
+                              size_t numExcludes)
+{
+    assert(numRoots >= 1);
+    static const std::string undefStr{std::to_string(static_cast<sqlite3_int64>(UNDEF))};
+    static const std::string sensMask{std::to_string(1ULL << Node::FLAGS_IS_MARKED_SENSITIVE)};
+
+    const std::string sensInitial =
+        excludeSensitive ? ("((n.flags & " + sensMask + ") != 0)") : std::string("0");
+    const std::string sensStep = excludeSensitive ?
+                                     ("up.sensSeen OR ((p.flags & " + sensMask + ") != 0)") :
+                                     std::string("0");
+    const std::string sensWhere =
+        excludeSensitive ? std::string(" AND up.sensSeen = 0") : std::string();
+    // Prune subtrees below a sensitive ancestor: once sensSeen flips to 1 the outer
+    // sensWhere will reject the row anyway, so there is nothing to learn by walking
+    // further up. Correctness-neutral — final filter is unchanged.
+    const std::string sensRecursiveCut =
+        excludeSensitive ? std::string(" AND up.sensSeen = 0") : std::string();
+
+    std::string rootInList;
+    for (size_t i = 0; i < numRoots; ++i)
+    {
+        if (i > 0)
+            rootInList += ", ";
+        rootInList += "?";
+        rootInList += std::to_string(filesRootParam + static_cast<int>(i));
+    }
+
+    const ExcludeSqlFragments exc = buildExcludeFragment(excludeHandleParam, numExcludes);
+
+    return "EXISTS ("
+           "WITH RECURSIVE up(h, sensSeen" +
+           exc.columnDecl +
+           ") AS ("
+           "SELECT n.parenthandle, " +
+           sensInitial + exc.initial +
+           " "
+           "UNION ALL "
+           "SELECT p.parenthandle, " +
+           sensStep + exc.step +
+           " "
+           "FROM nodes AS p JOIN up ON p.nodehandle = up.h "
+           "WHERE up.h IS NOT NULL AND up.h != " +
+           undefStr + sensRecursiveCut + exc.recursiveCut +
+           ") "
+           "SELECT 1 FROM up WHERE up.h IN (" +
+           rootInList + ")" + sensWhere + exc.outerWhere +
+           " LIMIT 1"
+           ")";
+}
+
 // Builds a single-route SELECT for listAllNodesByPage given a mime filter condition
 // (either a literal value for grouped/CTE routes or a bound parameter for simple ones).
+//
+// Applies three always-on filters in addition to the caller-provided mime filter:
+//   1. (flags & FLAGS_IS_VERSION) = 0   — exclude file versions
+//   2. EXISTS(walk up to any of the caller-supplied filesRoots) — restrict the row to the
+//                                         subtree rooted at Cloud / Vault / explicit ancestor
+//   3. [cursor] / [bounding]            — keyset pagination, optional
+// When excludeSensitive is true, filter 2 also requires every walked ancestor (n inclusive,
+// matched root exclusive) to have FLAGS_IS_MARKED_SENSITIVE clear.
+//
+// Rendered SQL examples (regenerate from this builder + buildUpWalkExists if either changes):
+//
+// Example 1 — ORDER_DEFAULT_ASC, 1 root, no cursor, no excludes, excludeSensitive=false.
+// Slot layout: ?1=LIMIT, ?2=mimeFilter, ?3=filesRoots[0].
+//
+//   SELECT nodehandle, counter, node, type, sizeVirtual, mtime, name, label, fav
+//   FROM nodes AS n
+//   WHERE mimetypeVirtual = ?2
+//     AND (n.flags & 1) = 0
+//     AND EXISTS (
+//       WITH RECURSIVE up(h, sensSeen) AS (
+//         SELECT n.parenthandle, 0
+//         UNION ALL
+//         SELECT p.parenthandle, 0
+//         FROM nodes AS p JOIN up ON p.nodehandle = up.h
+//         WHERE up.h IS NOT NULL AND up.h != -1   -- UNDEF
+//       )
+//       SELECT 1 FROM up WHERE up.h IN (?3) LIMIT 1
+//     )
+//   ORDER BY name COLLATE NATURALNOCASE ASC, nodehandle ASC
+//   LIMIT ?1
+//
+// Example 2 — ORDER_SIZE_DESC, 2 roots, hasCursor=true, 1 exclude, excludeSensitive=true.
+// Slot layout: ?1=LIMIT, ?2=mimeFilter, ?3..?4=filesRoots, ?5=excludeHandles[0],
+// ?6=cursor.lastSize, ?7=cursor.lastName, ?8=cursor.lastHandle.
+//
+//   SELECT nodehandle, counter, node, type, sizeVirtual, mtime, name, label, fav
+//   FROM nodes AS n
+//   WHERE mimetypeVirtual = ?2
+//     AND (n.flags & 1) = 0
+//     AND EXISTS (
+//       WITH RECURSIVE up(h, sensSeen, excSeen) AS (
+//         SELECT n.parenthandle,
+//                ((n.flags & 4) != 0),
+//                (n.nodehandle IN (?5))
+//         UNION ALL
+//         SELECT p.parenthandle,
+//                up.sensSeen OR ((p.flags & 4) != 0),
+//                up.excSeen OR (p.nodehandle IN (?5))
+//         FROM nodes AS p JOIN up ON p.nodehandle = up.h
+//         WHERE up.h IS NOT NULL AND up.h != -1   -- UNDEF
+//           AND up.sensSeen = 0
+//           AND up.excSeen = 0
+//       )
+//       SELECT 1 FROM up
+//       WHERE up.h IN (?3, ?4)
+//         AND up.sensSeen = 0
+//         AND up.excSeen = 0
+//         AND up.h NOT IN (?5)
+//       LIMIT 1
+//     )
+//     AND (sizeVirtual < ?6 OR (sizeVirtual = ?6 AND name <= ?7 COLLATE NATURALNOCASE))
+//     AND (sizeVirtual < ?6
+//          OR (sizeVirtual = ?6 AND name < ?7 COLLATE NATURALNOCASE)
+//          OR (sizeVirtual = ?6 AND name = ?7 COLLATE NATURALNOCASE AND nodehandle < ?8))
+//   ORDER BY sizeVirtual DESC, name COLLATE NATURALNOCASE DESC, nodehandle DESC
+//   LIMIT ?1
 std::string buildListAllRouteSelect(const std::string& mimeFilterClause,
                                     int order,
                                     bool hasCursor,
-                                    int cursorStartParam)
+                                    int cursorStartParam,
+                                    int filesRootParam,
+                                    size_t numRoots,
+                                    bool excludeSensitive,
+                                    int excludeHandleParam,
+                                    size_t numExcludes)
 {
     std::vector<std::string> conditions;
     conditions.push_back(mimeFilterClause);
+    conditions.push_back("(n.flags & " + std::to_string(1ULL << Node::FLAGS_IS_VERSION) + ") = 0");
+    conditions.push_back(buildUpWalkExists(filesRootParam,
+                                           numRoots,
+                                           excludeSensitive,
+                                           excludeHandleParam,
+                                           numExcludes));
 
     if (hasCursor)
     {
@@ -2871,7 +3102,7 @@ std::string buildListAllRouteSelect(const std::string& mimeFilterClause,
 
     return "SELECT " + listAllNodesResultCols() +
            " \n"
-           "FROM nodes \n" +
+           "FROM nodes AS n \n" +
            buildWhereClauseForListAll(std::move(conditions)) + "ORDER BY \n" +
            buildOrderByForListAll(order) +
            " \n"
@@ -2879,8 +3110,15 @@ std::string buildListAllRouteSelect(const std::string& mimeFilterClause,
            kLaIdPageSize;
 }
 
-std::string
-    buildGroupedListAllQuery(MimeType_t mimeType, int order, bool hasCursor, int cursorStartParam)
+std::string buildGroupedListAllQuery(MimeType_t mimeType,
+                                     int order,
+                                     bool hasCursor,
+                                     int cursorStartParam,
+                                     int filesRootParam,
+                                     size_t numRoots,
+                                     bool excludeSensitive,
+                                     int excludeHandleParam,
+                                     size_t numExcludes)
 {
     assert(isGroupMimeTypeForListAll(mimeType));
 
@@ -2902,7 +3140,12 @@ std::string
                                             std::to_string(static_cast<int>(routeMimeTypes[i])),
                                         order,
                                         hasCursor,
-                                        cursorStartParam) +
+                                        cursorStartParam,
+                                        filesRootParam,
+                                        numRoots,
+                                        excludeSensitive,
+                                        excludeHandleParam,
+                                        numExcludes) +
                 "\n)";
         merged += "SELECT " + listAllNodesResultCols() + " \nFROM " + routeName + "\n";
     }
@@ -2922,24 +3165,63 @@ std::string
            kLaIdPageSize;
 }
 
+bool validateListAllHandles(const std::vector<NodeHandle>& handles,
+                            size_t maxSize,
+                            const char* label,
+                            const char* maxLabel)
+{
+    if (handles.size() > maxSize)
+    {
+        LOG_warn << "listAllNodesByPage: " << label << ".size()=" << handles.size() << " exceeds "
+                 << maxLabel << "=" << maxSize;
+        return false;
+    }
+    if (std::any_of(handles.begin(),
+                    handles.end(),
+                    [](NodeHandle h)
+                    {
+                        return h.isUndef();
+                    }))
+    {
+        LOG_warn << "listAllNodesByPage: " << label
+                 << " contains UNDEF handle — caller contract requires all handles to be valid; "
+                    "returning empty";
+        return false;
+    }
+    return true;
+}
+
 } // anonymous namespace (listAllNodesByPage helpers)
 
 bool SqliteAccountState::listAllNodesByPage(
-    MimeType_t mimeType,
-    int order,
+    const ListAllNodesParams& params,
+    const std::vector<NodeHandle>& filesRoots,
     std::vector<std::pair<NodeHandle, NodeSerialized>>& nodes,
-    CancelToken cancelFlag,
-    size_t maxElements,
-    const std::optional<NodeSearchCursorOffset>& cursor)
+    CancelToken cancelFlag)
 {
     if (!db)
         return false;
 
-    if (mimeType == MIME_TYPE_UNKNOWN)
+    if (params.mimeType == MIME_TYPE_UNKNOWN)
     {
-        LOG_err << "listAllNodesByPage: invalid mimeType value " << mimeType;
+        LOG_warn << "listAllNodesByPage: invalid mimeType value " << params.mimeType;
         return false;
     }
+
+    if (filesRoots.empty())
+    {
+        LOG_warn << "listAllNodesByPage: filesRoots is empty; returning empty";
+        return false;
+    }
+
+    if (!validateListAllHandles(filesRoots, kListAllMaxRoots, "filesRoots", "kListAllMaxRoots"))
+        return false;
+
+    if (!validateListAllHandles(params.excludeHandles,
+                                kListAllMaxExcludes,
+                                "excludeHandles",
+                                "kListAllMaxExcludes"))
+        return false;
 
     if (cancelFlag.exists())
         sqlite3_progress_handler(db,
@@ -2947,27 +3229,29 @@ bool SqliteAccountState::listAllNodesByPage(
                                  SqliteAccountState::progressHandler,
                                  static_cast<void*>(&cancelFlag));
 
-    const bool hasCursor = cursor.has_value();
+    const bool hasCursor = params.cursor.has_value();
+    const size_t numRoots = filesRoots.size();
+    const size_t numExcludes = params.excludeHandles.size();
 
     // Group types are expanded into one top-N CTE per concrete mime, merged with UNION ALL.
-    const bool isGroupMimeType = isGroupMimeTypeForListAll(mimeType);
+    const bool isGroupMimeType = isGroupMimeTypeForListAll(params.mimeType);
     // Group mime types use literal per-route WHERE clauses in CTEs — no parameter slot needed.
     const bool mimeFilterNeedsParam = !isGroupMimeType;
 
-    // Cache key encodes the three dimensions that affect the SQL text.
-    // Stride must cover all valid order values. Update if new OrderByClause values are
-    // added beyond FAV_DESC, and adjust the assert to the new maximum.
-    static_assert(OrderByClause::FAV_DESC == 20,
-                  "FAV_DESC changed; verify kListAllOrderStride still covers all order values");
-    constexpr size_t kListAllOrderStride = static_cast<size_t>(OrderByClause::FAV_DESC) + 1;
-    const size_t cacheId =
-        (static_cast<size_t>(mimeType) * kListAllOrderStride + static_cast<size_t>(order)) * 2 +
-        (hasCursor ? 1u : 0u);
+    const size_t cacheId = computeListAllCacheId(params.mimeType,
+                                                 params.order,
+                                                 hasCursor,
+                                                 params.excludeSensitive,
+                                                 numRoots,
+                                                 numExcludes);
     sqlite3_stmt*& stmt = mStmtListAllNodesByPage[cacheId];
 
-    // Slot after ?1=pageSize and optional mimeFilter.
+    // Slot layout: ?1=pageSize, optional mimeFilter, numRoots contiguous filesRoot slots,
+    // numExcludes contiguous exclude-handle slots, then the optional cursor slots.
     const int mimeFilterParam = 2;
-    const int cursorStartParam = mimeFilterParam + (mimeFilterNeedsParam ? 1 : 0);
+    const int filesRootParam = mimeFilterParam + (mimeFilterNeedsParam ? 1 : 0);
+    const int excludeHandleParam = filesRootParam + static_cast<int>(numRoots);
+    const int cursorStartParam = excludeHandleParam + static_cast<int>(numExcludes);
 
     int sqlResult = SQLITE_OK;
     if (!stmt)
@@ -2975,14 +3259,27 @@ bool SqliteAccountState::listAllNodesByPage(
         std::string query;
         if (isGroupMimeType)
         {
-            query = buildGroupedListAllQuery(mimeType, order, hasCursor, cursorStartParam);
+            query = buildGroupedListAllQuery(params.mimeType,
+                                             params.order,
+                                             hasCursor,
+                                             cursorStartParam,
+                                             filesRootParam,
+                                             numRoots,
+                                             params.excludeSensitive,
+                                             excludeHandleParam,
+                                             numExcludes);
         }
         else
         {
             query = buildListAllRouteSelect("mimetypeVirtual = ?" + std::to_string(mimeFilterParam),
-                                            order,
+                                            params.order,
                                             hasCursor,
-                                            cursorStartParam);
+                                            cursorStartParam,
+                                            filesRootParam,
+                                            numRoots,
+                                            params.excludeSensitive,
+                                            excludeHandleParam,
+                                            numExcludes);
         }
         sqlResult = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
         if (sqlResult != SQLITE_OK)
@@ -2993,16 +3290,43 @@ bool SqliteAccountState::listAllNodesByPage(
         }
     }
 
-    const sqlite3_int64 pageSize = maxElements == 0 ? -1 : static_cast<sqlite3_int64>(maxElements);
+    const sqlite3_int64 pageSize =
+        params.maxElements == 0 ? -1 : static_cast<sqlite3_int64>(params.maxElements);
     bindValue(sqlResult, stmt, kLaIdPageSize, pageSize, sqlite3_bind_int64);
 
     if (mimeFilterNeedsParam)
-        bindValue(sqlResult, stmt, mimeFilterParam, static_cast<int>(mimeType), sqlite3_bind_int);
+        bindValue(sqlResult,
+                  stmt,
+                  mimeFilterParam,
+                  static_cast<int>(params.mimeType),
+                  sqlite3_bind_int);
 
-    if (hasCursor && !bindCursorParamsForListAll(sqlResult, stmt, order, cursorStartParam, *cursor))
+    for (size_t i = 0; i < numRoots; ++i)
     {
-        LOG_err << "listAllNodesByPage: cursor is missing the required field for order " << order
-                << "; cursor was likely built for a different sort order";
+        bindValue(sqlResult,
+                  stmt,
+                  filesRootParam + static_cast<int>(i),
+                  static_cast<sqlite3_int64>(filesRoots[i].as8byte()),
+                  sqlite3_bind_int64);
+    }
+
+    for (size_t i = 0; i < numExcludes; ++i)
+    {
+        bindValue(sqlResult,
+                  stmt,
+                  excludeHandleParam + static_cast<int>(i),
+                  static_cast<sqlite3_int64>(params.excludeHandles[i].as8byte()),
+                  sqlite3_bind_int64);
+    }
+
+    if (hasCursor && !bindCursorParamsForListAll(sqlResult,
+                                                 stmt,
+                                                 params.order,
+                                                 cursorStartParam,
+                                                 *params.cursor))
+    {
+        LOG_warn << "listAllNodesByPage: cursor is missing the required field for order "
+                 << params.order << "; cursor was likely built for a different sort order";
         sqlite3_progress_handler(db, -1, nullptr, nullptr);
         sqlite3_reset(stmt);
         return false;
@@ -3556,7 +3880,7 @@ void SqliteAccountState::userMatchFilter(sqlite3_context* context, int argc, sql
         return;
 
     // sensitive
-    constexpr int64_t sensitivityFlag = 1 << Node::FLAGS_IS_MARKED_SENSTIVE;
+    constexpr int64_t sensitivityFlag = 1 << Node::FLAGS_IS_MARKED_SENSITIVE;
     if (!filter->isValidSensitivity((flags & sensitivityFlag) == sensitivityFlag))
         return;
 

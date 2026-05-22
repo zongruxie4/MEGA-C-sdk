@@ -174,7 +174,7 @@ Node::Flags Node::getDBFlagsBitset() const
     Flags flags;
     flags.set(FLAGS_IS_VERSION, parent && parent->type == FILENODE);
     flags.set(FLAGS_IS_IN_RUBBISH, isAncestor(client->mNodeManager.getRootNodeRubbish()));
-    flags.set(FLAGS_IS_MARKED_SENSTIVE, isMarkedSensitive());
+    flags.set(FLAGS_IS_MARKED_SENSITIVE, isMarkedSensitive());
     return flags;
 }
 
@@ -189,7 +189,7 @@ uint64_t Node::getDBFlags(uint64_t oldFlags, bool isInRubbish, bool isVersion, b
     Flags flags = oldFlags;
     flags.set(FLAGS_IS_VERSION, isVersion);
     flags.set(FLAGS_IS_IN_RUBBISH, isInRubbish);
-    flags.set(FLAGS_IS_MARKED_SENSTIVE, isSensitive);
+    flags.set(FLAGS_IS_MARKED_SENSITIVE, isSensitive);
     return flags.to_ulong();
 }
 
