@@ -3,3 +3,4 @@ python-gitlab
 slack_sdk
 github3.py
 atlassian-python-api
+cryptography>=46.0.5 # not directly required, pinned by Snyk to avoid a vulnerability
