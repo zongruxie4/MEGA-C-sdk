@@ -3,3 +3,5 @@ python-gitlab
 slack_sdk
 github3.py
 atlassian-python-api
+idna>=3.15 # not directly required, pinned by Snyk to avoid a vulnerability
+pyjwt>=2.11.0 # not directly required, pinned by Snyk to avoid a vulnerability
